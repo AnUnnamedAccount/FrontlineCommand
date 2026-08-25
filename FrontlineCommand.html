@@ -582,12 +582,14 @@ let units=[];
 let structures=[];
 let bullets=[];
 let particles=[];
+let blastRings=[];
 let flags=[];
 let trees=[];
 let corpses=[];
 let choppers=[];
 let kamikazeDrones=[];
 let mines=[];
+let airstrikePlanes=[];
 
 let treeGrid=new Map();
 const TREE_CELL=110;
@@ -610,12 +612,16 @@ const teamNames=[
 ];
 
 const teams=[
-  {res:650,score:0,aiTimer:0,weaponTier:0,construction:null,pendingSupply:null,
+  {res:650,score:0,aiTimer:0,construction:null,pendingSupply:null,
    commsTimer:3+rand()*3,commsPending:false,focus:"balanced",lastReportUnits:0,
-   followFocus:"balanced",totalKills:0,casualties:0},
-  {res:650,score:0,aiTimer:0,weaponTier:0,construction:null,pendingSupply:null,
+   followFocus:"balanced",totalKills:0,casualties:0,
+   airstrikeReadyTime:gameTime+60,pendingAirstrike:null,pendingUpgrades:[],
+   spawnRecency:{}},
+  {res:650,score:0,aiTimer:0,construction:null,pendingSupply:null,
    commsTimer:3+rand()*3,commsPending:false,focus:"balanced",lastReportUnits:0,
-   followFocus:"balanced",totalKills:0,casualties:0}
+   followFocus:"balanced",totalKills:0,casualties:0,
+   airstrikeReadyTime:gameTime+60,pendingAirstrike:null,pendingUpgrades:[],
+   spawnRecency:{}}
 ];
 
 // A "day" in the simulation, used for engineer build/resupply timers.
@@ -657,61 +663,89 @@ const TYPES={
  rifleman:{
   cost:20,hp:100,speed:58,
   range:205,damage:13,rate:.65,
-  radius:15
+  radius:15,
+  magSize:30,reserveSize:90,reloadTime:2.2,
+  // Melee stab rate — see resolveMeleeAttack(). Picked so
+  // sustained effective DPS (accounting for the 25% miss chance
+  // and its .1s penalty) lands around 22, roughly matching this
+  // unit's own ranged output.
+  stabRate:1.5
  },
 
  mg:{
   cost:45,hp:115,speed:35,
   range:300,damage:10,rate:.17,
-  radius:17
+  radius:17,
+  magSize:120,reserveSize:360,reloadTime:4.5
  },
 
  medic:{
   cost:30,hp:80,speed:50,
   range:75,damage:6,rate:1,
-  radius:14
+  radius:14,
+  magSize:12,reserveSize:24,reloadTime:1.5
  },
 
  leader:{
   cost:60,hp:140,speed:55,
   range:225,damage:15,rate:.55,
-  radius:18
+  radius:18,
+  magSize:28,reserveSize:84,reloadTime:2,
+  // Faster stab rate than rifleman/grenadier — matches this
+  // unit's generally sharper combat stats.
+  stabRate:1.3
  },
 
  marksman:{
   cost:65,hp:85,speed:45,
   range:620,damage:48,rate:2.8,
-  radius:15
+  radius:15,
+  magSize:5,reserveSize:28,reloadTime:3
  },
 
  grenadier:{
   cost:55,hp:100,speed:41,
   range:245,damage:38,rate:2,
-  radius:16
+  radius:16,
+  magSize:5,reserveSize:20,reloadTime:2.8,
+  // Slightly slower than rifleman — grenadier isn't primarily a
+  // close-quarters specialist.
+  stabRate:1.6
  },
 
  comms:{
   cost:50,hp:85,speed:43,
   range:120,damage:7,rate:1,
-  radius:14
+  radius:14,
+  magSize:10,reserveSize:30,reloadTime:1.5
  },
 
  engineer:{
   cost:40,hp:95,speed:43,
   range:165,damage:9,rate:.8,
-  radius:15
+  radius:15,
+  magSize:20,reserveSize:60,reloadTime:2
  },
 
  vehicle:{
   cost:140,hp:280,speed:48,
   range:270,damage:26,rate:.5,
-  radius:24
+  radius:24,
+  magSize:10,reserveSize:70,reloadTime:2.5
  },
 
  mortar:{
   cost:90,hp:85,speed:22,
   range:560,damage:55,rate:3.4,
-  radius:17
+  radius:17,
+  magSize:2,reserveSize:14,reloadTime:6
+ },
+
+ supplier:{
+  cost:50,hp:80,speed:46,
+  range:110,damage:5,rate:1,
+  radius:14,
+  magSize:8,reserveSize:24,reloadTime:1.5
  }
 
 };
@@ -745,7 +779,8 @@ const ROLE_BY_TYPE={
 
   medic:"support",
   comms:"support",
-  engineer:"support"
+  engineer:"support",
+  supplier:"support"
 };
 
 
@@ -949,6 +984,51 @@ function buildTreeGrid(){
 
     treeGrid.get(key).push(t);
   }
+}
+
+
+function findDenseEnemyPoint(team){
+
+  // Coarse grid-binning to find where the enemy is currently
+  // clustered — same spirit as treeGrid's spatial hash above, just
+  // used once per airstrike call rather than kept live. Much
+  // cheaper than a per-unit O(n^2) distance-clustering scan, and
+  // simple enough that it doesn't need to be.
+  const CELL=300;
+  const counts=new Map();
+
+  for(const u of units){
+
+    if(u.team===team||u.hp<=0)
+      continue;
+
+    const gx=Math.floor(u.x/CELL);
+    const gy=Math.floor(u.y/CELL);
+    const key=gx+","+gy;
+
+    counts.set(key,(counts.get(key)||0)+1);
+  }
+
+  let bestKey=null;
+  let bestCount=0;
+
+  for(const[key,count] of counts){
+
+    if(count>bestCount){
+      bestCount=count;
+      bestKey=key;
+    }
+  }
+
+  if(!bestKey)
+    return null;
+
+  const[gx,gy]=bestKey.split(",").map(Number);
+
+  return {
+    x:(gx+.5)*CELL,
+    y:(gy+.5)*CELL
+  };
 }
 
 
@@ -1330,13 +1410,18 @@ function makeSingleRoomBuilding(x,y){
   // sometimes landing as a single too-narrow segment nobody can
   // actually walk through. That per-run randomness (not a fixed
   // door width/count) is still what produces the irregular gap
-  // pattern. Openings are simply segments that never get added to
-  // `walls`, so LOS/collision/bullets naturally pass through them
-  // without any special-cased "is this a door" lookup.
-  const walls=[];
-  let openings=0;
+  // pattern.
+  //
+  // Solid/open state is tracked per segment here (rather than
+  // emitting wall geometry immediately) so a top-up pass below can
+  // guarantee a minimum amount of actual wall, since a short side
+  // can otherwise roll one single open run that swallows the
+  // entire side and leaves it with no wall at all.
   const segLen=34;
   const MIN_OPEN_RUN=3;
+  const MIN_WALL_SEGMENTS=4;
+
+  const sideSegs=[];
 
   for(let side=0;side<4;side++){
 
@@ -1344,6 +1429,7 @@ function makeSingleRoomBuilding(x,y){
     const p2=sides[side][1];
     const len=Math.hypot(p2.x-p1.x,p2.y-p1.y);
     const count=Math.max(MIN_OPEN_RUN,Math.round(len/segLen));
+    const solid=new Array(count).fill(true);
 
     let i=0;
 
@@ -1371,7 +1457,9 @@ function makeSingleRoomBuilding(x,y){
           count-i
         );
 
-        openings+=runLen;
+        for(let k=0;k<runLen;k++)
+          solid[i+k]=false;
+
         i+=runLen;
 
       }else{
@@ -1389,41 +1477,135 @@ function makeSingleRoomBuilding(x,y){
           count-i
         );
 
-        for(let k=0;k<runLen;k++){
-
-          const t0=(i+k)/count;
-          const t1=(i+k+1)/count;
-
-          walls.push({
-            x1:p1.x+(p2.x-p1.x)*t0,
-            y1:p1.y+(p2.y-p1.y)*t0,
-            x2:p1.x+(p2.x-p1.x)*t1,
-            y2:p1.y+(p2.y-p1.y)*t1
-          });
-        }
-
         i+=runLen;
       }
     }
+
+    sideSegs.push({p1,p2,count,solid});
+  }
+
+  function totalSolid(){
+
+    let n=0;
+
+    for(const s of sideSegs)
+      for(const v of s.solid)
+        if(v)
+          n++;
+
+    return n;
+  }
+
+  function openRuns(){
+
+    const runs=[];
+
+    for(let side=0;side<4;side++){
+
+      const s=sideSegs[side];
+      let runStart=null;
+
+      for(let i=0;i<=s.count;i++){
+
+        const open=i<s.count&&!s.solid[i];
+
+        if(open&&runStart===null)
+          runStart=i;
+
+        if((!open||i===s.count)&&runStart!==null){
+          runs.push({side,start:runStart,length:i-runStart});
+          runStart=null;
+        }
+      }
+    }
+
+    return runs;
   }
 
   // Safety net — guarantee at least one properly-sized opening
-  // exists even if every run happened to roll solid. Only ever
-  // fires when openings is still 0, which means nothing has been
-  // carved out of any side yet — so `walls` at this point is one
-  // unbroken loop around the whole perimeter, and any MIN_OPEN_RUN
-  // consecutive entries in it are genuinely adjacent segments.
-  if(openings===0&&walls.length>=MIN_OPEN_RUN){
+  // exists even if every run happened to roll solid. Carves one
+  // out of whichever side has the most segments to work with.
+  if(totalSolid()===sideSegs.reduce((n,s)=>n+s.count,0)){
+
+    let best=0;
+
+    for(let side=1;side<4;side++)
+      if(sideSegs[side].count>sideSegs[best].count)
+        best=side;
+
+    const s=sideSegs[best];
 
     const startIdx=Math.floor(
-      hash(bx+99,by+199)*(walls.length-MIN_OPEN_RUN+1)
+      hash(bx+99,by+199)*(s.count-MIN_OPEN_RUN+1)
     );
 
-    walls.splice(startIdx,MIN_OPEN_RUN);
+    for(let k=0;k<MIN_OPEN_RUN;k++)
+      s.solid[startIdx+k]=false;
+  }
 
-  }else if(openings===0){
+  // Top-up pass — guarantee at least MIN_WALL_SEGMENTS solid
+  // segments total, so a building never reads as "barely any
+  // walls." Always shrinks the CURRENTLY-LARGEST open run by one
+  // segment at a time first (it has the most slack above
+  // MIN_OPEN_RUN), only fully closing a run once it's already at
+  // that passable-width floor — and never closes the very last
+  // opening left, so the room always stays enterable.
+  let guard=0;
 
-    walls.length=0;
+  while(totalSolid()<MIN_WALL_SEGMENTS&&guard<40){
+
+    guard++;
+
+    const runs=openRuns();
+
+    if(!runs.length)
+      break;
+
+    let best=runs[0];
+
+    for(const rn of runs)
+      if(rn.length>best.length)
+        best=rn;
+
+    if(best.length>MIN_OPEN_RUN){
+
+      sideSegs[best.side].solid[best.start]=true;
+
+    }else if(runs.length>1){
+
+      for(let k=0;k<best.length;k++)
+        sideSegs[best.side].solid[best.start+k]=true;
+
+    }else{
+
+      break;
+    }
+  }
+
+  // Emit the actual wall segment geometry from the final
+  // solid/open state. Openings are simply segments that never get
+  // added to `walls`, so LOS/collision/bullets naturally pass
+  // through them without any special-cased "is this a door"
+  // lookup.
+  const walls=[];
+
+  for(const{p1,p2,count,solid} of sideSegs){
+
+    for(let i=0;i<count;i++){
+
+      if(!solid[i])
+        continue;
+
+      const t0=i/count;
+      const t1=(i+1)/count;
+
+      walls.push({
+        x1:p1.x+(p2.x-p1.x)*t0,
+        y1:p1.y+(p2.y-p1.y)*t0,
+        x2:p1.x+(p2.x-p1.x)*t1,
+        y2:p1.y+(p2.y-p1.y)*t1
+      });
+    }
   }
 
   const hp=Math.round(650+(halfW+halfH)*3);
@@ -1586,6 +1768,47 @@ function isNearDoor(s,x,y){
 }
 
 
+function nearestDoorPoint(s,fromX,fromY){
+
+  // A structure's bare center sits deep inside its solid disc —
+  // blocked() only lets a unit through within 24px of one of the
+  // four door points (see isNearDoor above), so sending a goal
+  // straight at the center makes a unit walk up to the wall, get
+  // rejected, and re-target the same unreachable point forever
+  // (the frozen-at-HQ bug). Biasing toward whichever door pocket
+  // is closest to the unit's approach angle fixes that, and a
+  // small jitter — same idea as the defender fallback's spread —
+  // keeps multiple units retreating to the same door from all
+  // stacking on the exact same pixel.
+  const r=s.r;
+
+  const doors=[
+    {x:s.x,y:s.y-r},
+    {x:s.x,y:s.y+r},
+    {x:s.x-r,y:s.y},
+    {x:s.x+r,y:s.y}
+  ];
+
+  let best=doors[0];
+  let bestD=Infinity;
+
+  for(const d of doors){
+
+    const dist=Math.hypot(fromX-d.x,fromY-d.y);
+
+    if(dist<bestD){
+      bestD=dist;
+      best=d;
+    }
+  }
+
+  return {
+    x:best.x+(rand()-.5)*20,
+    y:best.y+(rand()-.5)*20
+  };
+}
+
+
 /* =========================================================
    UNITS
 ========================================================= */
@@ -1612,8 +1835,59 @@ function makeUnit(type,team,x,y){
 
     cd:rand()*t.rate,
 
+    // Ammo — see shoot() and the reload-timer decrement in
+    // simulationStep(). Starts topped up: a full magazine plus a
+    // full reserve on top of it.
+    mag:t.magSize,
+    reserve:t.reserveSize,
+    reloading:false,
+    reloadTimer:0,
+
+    // Set the moment a reload finishes, so the ammo readout (see
+    // drawUnit()) knows when to start fading back out.
+    lastReloadTime:-999,
+
+    // Supplier's 1000-round pack, drawn down as it resupplies
+    // allies in the field — see updateSupplyDeliveries() and the
+    // supplier behavior block in updateUnitAI(). Meaningless for
+    // any other type.
+    ammoPack:type==="supplier"?1000:0,
+
+    // Set on a Supplier that's physically carrying a completed
+    // upgrade kit (see processTeamTimers()) out to whoever it fits
+    // — null, "ghillie", or "laserSights". Lost for good if this
+    // Supplier dies before delivering it.
+    carryingUpgrade:null,
+
+    // Field resupply — mirrors the medic critical-revive timer
+    // pattern (reviveProgress/reviveRequired above): a receiving
+    // unit accumulates progress while a Supplier is in range,
+    // taking 3-7s depending on how much reserve is actually
+    // missing, resolved by updateSupplyDeliveries() each frame.
+    resupplyProgress:0,
+    resupplyRequired:undefined,
+    beingResupplied:false,
+
     goal:null,
     order:"idle",
+
+    // Placeholder hook for the eventual empty-handed melee
+    // mechanic — see the out-of-ammo branch in updateUnitAI().
+    // Not real combat yet, just tracks whether this unit is
+    // currently in that state.
+    meleeFallback:false,
+
+    // Melee combat — see resolveMeleeAttack()/updateBleeding().
+    // meleeCd is a separate cooldown from the ranged u.cd, so
+    // switching to a knife doesn't fight over the same timer as
+    // a rifle. recentlyStabbedTimer arms briefly on a landed hit
+    // (see RECENTLY_STABBED_WINDOW) — if the victim starts
+    // retreating while it's still active, bleeding kicks in.
+    meleeCd:0,
+    recentlyStabbedTimer:0,
+    bleeding:false,
+    bleedTimeLeft:0,
+    bleedTickTimer:0,
 
     kills:0,
     brain:rand(),
@@ -1686,7 +1960,26 @@ function makeUnit(type,team,x,y){
 // High-value roles worth prioritizing when a comparably-close
 // alternative target is available — killing a medic or leader
 // hurts the enemy team more than another rifleman.
-const HIGH_VALUE_TYPES=["medic","leader","comms","engineer"];
+const HIGH_VALUE_TYPES=["medic","leader","comms","engineer","supplier"];
+
+function anyLivingEnemyInRange(u,range){
+
+  // Deliberately ignores line of sight — used only to tell mortar
+  // "there's nobody to shoot at all" apart from "there's someone
+  // out there, I just can't see them," which is exactly the
+  // distinction that triggers indirect fire.
+  for(const v of units){
+
+    if(v.team===u.team||v.hp<=0)
+      continue;
+
+    if(Math.hypot(u.x-v.x,u.y-v.y)<range)
+      return true;
+  }
+
+  return false;
+}
+
 
 function nearestEnemy(u,range=Infinity,preferValue=false){
 
@@ -1861,6 +2154,39 @@ function findBase(team){
 }
 
 
+function nearestSupplyDepot(team,x,y){
+
+  // Any of the team's own solid structures count as a depot for
+  // an empty Supplier to instantly refill at — a depot has
+  // effectively unlimited logistics, unlike a field handoff
+  // between two soldiers.
+  let best=null;
+  let bestD=Infinity;
+
+  for(const s of structures){
+
+    if(s.team!==team)
+      continue;
+
+    if(
+      s.kind!=="HQ"&&
+      s.kind!=="barracks"&&
+      s.kind!=="bunker"
+    )
+      continue;
+
+    const d=Math.hypot(s.x-x,s.y-y);
+
+    if(d<bestD){
+      bestD=d;
+      best=s;
+    }
+  }
+
+  return best;
+}
+
+
 function isSafeSpot(u){
 
   // Replaces the old ruin-specific isSheltered(). There's no more
@@ -1891,17 +2217,24 @@ function isSafeSpot(u){
 }
 
 
-function nearestSafePoint(team,x,y){
+function nearestSafePoint(team,x,y,includeSuppliers=false){
 
   // Whichever is closer: the team's own base, or the nearest
   // single-room building — used both by retreating units and by
   // anyone dragging a critical-failure casualty back to safety.
+  // When the retreat trigger is empty ammo rather than low HP,
+  // includeSuppliers also throws the nearest living Supplier into
+  // the running, since that's the actual fix for the problem.
   const base=findBase(team);
 
-  let best=
-    base?
-    {x:base.x,y:base.y,d:Math.hypot(base.x-x,base.y-y)}:
-    null;
+  let best=null;
+
+  if(base){
+
+    const p=nearestDoorPoint(base,x,y);
+
+    best={x:p.x,y:p.y,d:Math.hypot(p.x-x,p.y-y)};
+  }
 
   for(const s of structures){
 
@@ -1912,6 +2245,25 @@ function nearestSafePoint(team,x,y){
 
     if(!best||d<best.d)
       best={x:s.x,y:s.y,d};
+  }
+
+  if(includeSuppliers){
+
+    for(const v of units){
+
+      if(
+        v.type!=="supplier"||
+        v.team!==team||
+        v.hp<=0||
+        v.critical
+      )
+        continue;
+
+      const d=Math.hypot(v.x-x,v.y-y);
+
+      if(!best||d<best.d)
+        best={x:v.x,y:v.y,d};
+    }
   }
 
   return best?{x:best.x,y:best.y}:null;
@@ -2057,6 +2409,113 @@ function countLeaderFollowers(leaderUnit,exclude=null){
 }
 
 
+// Melee tuning — point-blank engage range, distinct from any
+// unit's normal ranged `range` stat.
+const MELEE_ENGAGE_RANGE=45;
+
+// 25% miss chance, and a miss costs an extra .1s on top of the
+// normal stab-rate cooldown — a deliberate double penalty, not
+// just a coin-flip on damage.
+const MELEE_MISS_CHANCE=.25;
+const MELEE_MISS_PENALTY=.1;
+const MELEE_DAMAGE=45;
+
+// How long a "just got stabbed" flag stays armed — if the victim
+// starts retreating within this window, bleeding kicks in (see
+// updateBleeding()). Doesn't have to be the literal same tick as
+// the hit.
+const RECENTLY_STABBED_WINDOW=3;
+
+
+function isMeleeEligible(u){
+
+  // Same roster the out-of-ammo placeholder already used: rifleman
+  // and grenadier always (rusher/capturer by ROLE_BY_TYPE), a
+  // Leader only while its current dynamic behavior is actively
+  // rushing — same check chooseLeaderGoal()'s rush branch uses,
+  // not its static "defender" role tag. Vehicle never gets melee,
+  // even though it's technically a rusher too.
+  if(u.type==="vehicle")
+    return false;
+
+  if(u.type==="leader"){
+
+    return (
+      teams[u.team].focus==="rush"&&
+      countLeaderFollowers(u)>=LEADER_RUSH_FOLLOWER_THRESHOLD
+    );
+  }
+
+  return u.role==="capturer"||u.role==="rusher";
+}
+
+
+function resolveMeleeAttack(u,target){
+
+  if(u.meleeCd>0)
+    return;
+
+  const stabRate=TYPES[u.type].stabRate||1.5;
+
+  if(rand()<MELEE_MISS_CHANCE){
+
+    // Wastes the attempt AND costs extra time on top of the
+    // normal stab-rate cooldown.
+    u.meleeCd=stabRate+MELEE_MISS_PENALTY;
+    return;
+  }
+
+  damageUnit(target,MELEE_DAMAGE,u);
+
+  target.recentlyStabbedTimer=RECENTLY_STABBED_WINDOW;
+
+  u.meleeCd=stabRate;
+}
+
+
+function updateBleeding(dt){
+
+  // Deliberately separate from damageUnit() — bleeding can never
+  // be the direct cause of a unit going down, only get it close.
+  // Every other damage source routes through damageUnit(), which
+  // always triggers Critical Failure the instant HP crosses 0
+  // with no exceptions, so bleed can't reuse it as-is.
+  for(const u of units){
+
+    if(!u.bleeding)
+      continue;
+
+    if(u.hp<=0||u.critical){
+      u.bleeding=false;
+      continue;
+    }
+
+    u.bleedTickTimer-=dt;
+
+    if(u.bleedTickTimer<=0){
+
+      u.bleedTickTimer+=.5;
+
+      // Hard floor — withhold the tick entirely rather than
+      // applying partial damage and letting a normal 0-HP check
+      // fire from here.
+      if(u.hp-1<=0){
+        u.bleeding=false;
+        continue;
+      }
+
+      u.hp-=1;
+    }
+
+    u.bleedTimeLeft-=dt;
+
+    if(u.bleedTimeLeft<=0){
+      u.bleeding=false;
+    }
+  }
+}
+
+
 function updateLeaderFollowDwell(dt){
 
   // If a team's radioed focus changed, following ends immediately
@@ -2193,11 +2652,79 @@ function updateUnitAI(u,dt){
     u.type==="engineer"?.28:
     .22;
 
+  const wasRetreating=u.retreat;
+
   const breakPoint=
     t.hp*(bravery+(1-u.morale)*.18);
 
   if(u.hp<breakPoint){
     u.retreat=true;
+  }
+
+  // Completely out of ammo (magazine AND reserve both empty).
+  // Support/defense roles always fall back toward help — a medic,
+  // comms, engineer, supplier, mg, or a leader that isn't
+  // currently in an active rush all retreat the same way a
+  // badly-wounded unit does. Capturers and rushers (rifleman,
+  // grenadier — but never a vehicle, which has no infantry melee
+  // option) get an alternative: fighting on empty-handed instead
+  // of falling back — meleeFallback just flags that; the actual
+  // engagement is resolved by the close-quarters melee block
+  // below (isMeleeEligible() is the same check both triggers use).
+  if(isOutOfAmmo(u)){
+
+    if(isMeleeEligible(u)){
+
+      // Doesn't override an already-active retreat (e.g. a unit
+      // that's both badly wounded AND dry still falls back —
+      // melee is only the "otherwise fine, just out of bullets"
+      // case).
+      if(!u.retreat)
+        u.meleeFallback=true;
+
+    }else{
+
+      u.retreat=true;
+      u.meleeFallback=false;
+    }
+
+  }else{
+
+    u.meleeFallback=false;
+  }
+
+  // Close-quarters melee — independent of ammo. An eligible unit
+  // (rifleman/grenadier always, a Leader only while actively
+  // rushing, never a vehicle) swaps to melee the instant a living
+  // enemy is within point-blank range, even with a full magazine.
+  // An out-of-ammo eligible unit with nothing close enough yet
+  // (meleeFallback) closes the distance toward the nearest enemy
+  // instead of just standing idle with nothing to do.
+  if(u.meleeFallback||isMeleeEligible(u)){
+
+    if(!u.retreat){
+
+      const closeEnemy=nearestEnemy(u,MELEE_ENGAGE_RANGE,false);
+
+      if(closeEnemy||u.meleeFallback){
+
+        u.order="melee";
+
+        if(closeEnemy){
+
+          resolveMeleeAttack(u,closeEnemy);
+          u.goal=null;
+
+        }else{
+
+          const anyEnemy=nearestEnemy(u,engageRange*1.25,false);
+
+          u.goal=anyEnemy?{x:anyEnemy.x,y:anyEnemy.y}:null;
+        }
+
+        return;
+      }
+    }
   }
 
   const enemy=nearestEnemy(
@@ -2208,14 +2735,35 @@ function updateUnitAI(u,dt){
 
   if(u.retreat){
 
-    // Whichever's closer — the team's own base, or a nearby
-    // building — units now shelter at either when low on health.
-    const dest=nearestSafePoint(u.team,u.x,u.y);
+    // Whichever's closer — the team's own base, a nearby
+    // building, or (only when ammo is actually the problem) the
+    // nearest Supplier — units shelter at whichever fits the
+    // reason they're retreating.
+    const dest=nearestSafePoint(
+      u.team,
+      u.x,
+      u.y,
+      isOutOfAmmo(u)
+    );
 
     if(dest){
 
       u.goal=dest;
       u.order="retreat";
+    }
+
+    // Bleed kicks in only on the tick retreat actually starts
+    // (not every tick it's already retreating) while the
+    // recently-stabbed flag is still armed.
+    if(
+      !wasRetreating&&
+      u.retreat&&
+      u.recentlyStabbedTimer>0&&
+      !u.bleeding
+    ){
+      u.bleeding=true;
+      u.bleedTimeLeft=6;
+      u.bleedTickTimer=.5;
     }
 
     if(dest&&isSafeSpot(u)){
@@ -2227,9 +2775,15 @@ function updateUnitAI(u,dt){
 
       u.morale=Math.min(1,u.morale+dt*.4);
 
+      // Reaching a safe point and being healed stops bleeding
+      // early — same recovery trigger the ordinary HP-retreat
+      // healing above already uses, no separate path needed.
+      u.bleeding=false;
+
       if(
         u.hp>u.maxhp*.6&&
-        u.morale>.55
+        u.morale>.55&&
+        !isOutOfAmmo(u)
       )
         u.retreat=false;
     }
@@ -2300,6 +2854,10 @@ function updateUnitAI(u,dt){
             wounded.maxhp,
             wounded.hp+5
           );
+
+          // A medic's care stops the bleeding, same idea as
+          // reaching a safe point on your own already does.
+          wounded.bleeding=false;
         }
 
       }else{
@@ -2311,6 +2869,156 @@ function updateUnitAI(u,dt){
       }
 
       return;
+    }
+  }
+
+  // Supplier — carries a large field ammo pack and resupplies
+  // allies over time (see updateSupplyDeliveries(), which does
+  // the actual timed transfer once it's holding position next to
+  // someone). Running dry takes priority over everything else: it
+  // breaks off immediately and heads for the nearest depot, where
+  // refueling is instant — a depot has effectively unlimited
+  // logistics, a field handoff between two soldiers doesn't.
+  if(u.type==="supplier"){
+
+    if(u.ammoPack<=0){
+
+      const depot=nearestSupplyDepot(u.team,u.x,u.y);
+
+      if(depot){
+
+        if(Math.hypot(u.x-depot.x,u.y-depot.y)<depot.r+20){
+
+          u.ammoPack=1000;
+
+        }else{
+
+          u.goal={x:depot.x,y:depot.y};
+          u.order="resupplying";
+          return;
+        }
+      }
+    }
+
+    if(u.ammoPack>0){
+
+      // Pick up a waiting upgrade if empty-handed and one's
+      // queued for this team.
+      if(!u.carryingUpgrade&&teams[u.team].pendingUpgrades.length){
+        u.carryingUpgrade=teams[u.team].pendingUpgrades.shift();
+      }
+    }
+
+    // Carrying an upgrade is a specific, time-sensitive mission —
+    // it takes priority over routine ammo runs. Ghillie Suit and
+    // Laser Sights are both marksman-only and mutually exclusive
+    // with each other, same eligibility rule as before, just
+    // delivered instead of instantly auto-applied.
+    if(u.carryingUpgrade){
+
+      let target=null;
+      let bestD=Infinity;
+
+      for(const v of units){
+
+        if(
+          v.team!==u.team||
+          v.hp<=0||
+          v.critical||
+          v.type!=="marksman"||
+          v.ghillie||
+          v.laserSights
+        )
+          continue;
+
+        const d=Math.hypot(u.x-v.x,u.y-v.y);
+
+        if(d<bestD){
+          bestD=d;
+          target=v;
+        }
+      }
+
+      if(target){
+
+        const bd=Math.hypot(u.x-target.x,u.y-target.y);
+
+        if(bd<40){
+
+          if(u.carryingUpgrade==="ghillie")
+            target.ghillie=true;
+          else if(u.carryingUpgrade==="laserSights")
+            target.laserSights=true;
+
+          addChat(u.team,"Upgrade delivered.");
+
+          u.carryingUpgrade=null;
+          u.goal=null;
+
+        }else{
+
+          u.goal={x:target.x,y:target.y};
+        }
+
+        u.order="delivering";
+        return;
+      }
+
+      // Nobody eligible exists right now (no marksmen at all, or
+      // they're all already kitted out) — hang onto it and fall
+      // through to normal ammo duty below; it'll keep checking
+      // every tick for a marksman to hand it to.
+    }
+
+    if(u.ammoPack>0){
+
+      let neediest=null;
+      let bestScore=-Infinity;
+
+      for(const v of units){
+
+        if(
+          v===u||
+          v.team!==u.team||
+          v.hp<=0||
+          v.critical||
+          v.reserve>=TYPES[v.type].reserveSize
+        )
+          continue;
+
+        const d=Math.hypot(u.x-v.x,u.y-v.y);
+
+        if(d>600)
+          continue;
+
+        const deficit=TYPES[v.type].reserveSize-v.reserve;
+        const score=deficit-d*.2;
+
+        if(score>bestScore){
+          bestScore=score;
+          neediest=v;
+        }
+      }
+
+      if(neediest){
+
+        const bd=Math.hypot(u.x-neediest.x,u.y-neediest.y);
+
+        if(bd<SUPPLIER_RESUPPLY_RANGE){
+
+          // Close enough to work — hold position and let
+          // updateSupplyDeliveries() run the actual timed
+          // transfer each frame.
+          u.goal=null;
+
+        }else{
+
+          u.goal={x:neediest.x,y:neediest.y};
+        }
+
+        u.order="resupplying";
+        return;
+      }
     }
   }
 
@@ -2425,6 +3133,85 @@ function updateUnitAI(u,dt){
       u.order="attack";
       return;
     }
+  }
+
+  // Indirect fire — mortar's whole identity per the manual. We
+  // only get here when `enemy` above came up empty, which (thanks
+  // to nearestEnemy()'s sightBlocked() check) specifically means
+  // "nothing visible," not "nobody around." If there's a living
+  // enemy anywhere in range, lob a blind shell at wherever the
+  // enemy is currently clustered thickest (the same grid-binning
+  // findDenseEnemyPoint() the airstrike call-in uses) instead of
+  // just sitting idle behind the treeline. This is an accuracy
+  // trade, not omniscience — a random scatter (scaling with
+  // distance, so blind shots at max range are genuinely riskier
+  // than close ones) is applied before resolving the blast as a
+  // direct point-in-space detonation, the same pattern mines and
+  // airstrikes already use, rather than a traveling bullet — so
+  // it never has to (and never does) fly through a building wall
+  // to land. Buildings stay real shelter either way: this can hit
+  // an unseen area, but never lands a clean, precise hit on a
+  // specific hidden unit.
+  if(
+    u.type==="mortar"&&
+    anyLivingEnemyInRange(u,engageRange)
+  ){
+
+    u.goal=null;
+
+    if(u.cd<=0){
+
+      const aim=findDenseEnemyPoint(u.team);
+
+      if(aim&&tryConsumeAmmo(u)){
+
+        const bonus=leader?1.35:1;
+        const dist=Math.hypot(aim.x-u.x,aim.y-u.y);
+
+        // Scatter scales with distance: at max range (560) a
+        // high roll can push the impact well outside the 110px
+        // blast radius (a real miss), while a typical roll still
+        // lands solidly inside it. At short range the same
+        // formula keeps shots tight and reliable.
+        const scatterAngle=rand()*Math.PI*2;
+        const scatterDist=rand()*dist*.28;
+
+        const ix=aim.x+Math.cos(scatterAngle)*scatterDist;
+        const iy=aim.y+Math.sin(scatterAngle)*scatterDist;
+
+        u.cd=t.rate/bonus;
+
+        const blastR=110;
+
+        for(const v of units){
+
+          if(
+            v.team===u.team||
+            (v.hp<=0&&!v.critical)
+          )
+            continue;
+
+          const bd=Math.hypot(v.x-ix,v.y-iy);
+
+          if(bd<blastR){
+
+            const falloff=Math.max(0,1-bd/blastR);
+
+            damageUnit(
+              v,
+              t.damage*falloff,
+              u
+            );
+          }
+        }
+
+        spawnParticles(ix,iy,"#ffb347",10);
+        spawnParticles(ix,iy,"#ff5a3d",6);
+        spawnBlastRing(ix,iy,blastR,"#ff9a4d");
+      }
+    }
+
+    return;
   }
 
   // Leader-follow: a unit that's built up enough continuous
@@ -3003,7 +3790,8 @@ function moveUnit(u,dt){
 
   const speed=
     baseSpeed*
-    (nearOwnFlag(u)?1.1:1);
+    (nearOwnFlag(u)?1.1:1)*
+    (u.order==="melee"?1.5:1);
 
   const step=speed*dt;
 
@@ -3090,11 +3878,51 @@ function moveUnit(u,dt){
    SHOOTING
 ========================================================= */
 
+function isOutOfAmmo(u){
+
+  // True only once BOTH the magazine and the reserve are empty —
+  // a unit mid-reload still has ammo coming, so it isn't "out."
+  return u.mag<=0&&u.reserve<=0;
+}
+
+
+function tryConsumeAmmo(u){
+
+  // Returns true if a round was actually drawn from the magazine
+  // this call. Returns false if the unit can't fire right now —
+  // either it's already mid-reload, or the magazine just hit zero
+  // and this call is what triggers the reload to start (as long
+  // as there's reserve ammo left to pull from).
+  if(u.reloading)
+    return false;
+
+  if(u.mag<=0){
+
+    if(u.reserve>0){
+      u.reloading=true;
+      u.reloadTimer=TYPES[u.type].reloadTime;
+    }
+
+    return false;
+  }
+
+  u.mag--;
+  return true;
+}
+
+
 function shoot(u,target,rateBonus=1){
 
   const t=TYPES[u.type];
 
   if(u.cd>0)
+    return;
+
+  // Reload Time and `rate` stack rather than one replacing the
+  // other: `rate` still paces shots within a magazine (the check
+  // above), while running dry adds this separate, additional
+  // pause on top before the next shot is even possible.
+  if(!tryConsumeAmmo(u))
     return;
 
   u.cd=t.rate/rateBonus;
@@ -3107,7 +3935,9 @@ function shoot(u,target,rateBonus=1){
       target.x-u.x
     )+
     (rand()-.5)*
-    (u.type==="marksman"?.01:.06);
+    (u.type==="marksman"?.01:
+     u.type==="mortar"?.38:
+     .06);
 
   bullets.push({
     x:u.x,
@@ -3116,7 +3946,7 @@ function shoot(u,target,rateBonus=1){
     vx:Math.cos(angle)*600,
     vy:Math.sin(angle)*600,
 
-    damage:t.damage*(1+teams[u.team].weaponTier*.12),
+    damage:t.damage,
     team:u.team,
 
     life:1.1,
@@ -3167,13 +3997,19 @@ function pickSpawnType(team){
     grenadier:1,
     engineer:1,
     leader:1,
-    comms:1
+    comms:1,
+    supplier:1
   };
 
   // No working radio means no resupply calls, no drone requests,
   // and a silent comms panel — worth fixing fast.
   if(!has("comms"))
     weights.comms+=5;
+
+  // Nobody to reload a magazine in the field once it runs dry —
+  // just as urgent as getting a radio up.
+  if(!has("supplier"))
+    weights.supplier+=4;
 
   if(countOf("medic")<Math.ceil(mine.length*.12))
     weights.medic+=2;
@@ -3203,6 +4039,24 @@ function pickSpawnType(team){
     weights.marksman+=1;
   }
 
+  // Anti-repetition: the more of a type is already on the field,
+  // and the more often it's been picked lately, the less likely
+  // it gets picked again — and vice versa. Both fade the weight
+  // down (never below a small floor, so nothing becomes truly
+  // impossible), applied after the situational bonuses above so
+  // an urgent need (no comms, no supplier, etc.) still competes
+  // fairly rather than being drowned out entirely.
+  const recency=teams[team].spawnRecency;
+
+  for(const k in weights){
+
+    const onField=countOf(k);
+    const recent=recency[k]||0;
+
+    weights[k]/=(1+onField*.3);
+    weights[k]/=(1+recent*.45);
+  }
+
   let total=0;
 
   for(const k in weights)
@@ -3214,9 +4068,15 @@ function pickSpawnType(team){
 
     r-=weights[k];
 
-    if(r<=0)
+    if(r<=0){
+
+      recency[k]=(recency[k]||0)+1;
+
       return k;
+    }
   }
+
+  recency.rifleman=(recency.rifleman||0)+1;
 
   return "rifleman";
 }
@@ -3242,7 +4102,6 @@ function buildBattleSummary(team){
   return {
     team:teamNames[team],
     resources:Math.round(teams[team].res),
-    weaponTier:teams[team].weaponTier,
     ownUnits:countBy(mine),
     ownTotal:mine.length,
     ownDowned:units.filter(u=>u.team===team&&u.critical).length,
@@ -3446,6 +4305,14 @@ function commanderAI(team,dt){
 
   teams[team].aiTimer=.7+rand()*.8;
 
+  // Fades recent-spawn memory over time (used by pickSpawnType's
+  // anti-repetition weighting) — roughly a 10-15s memory of "what
+  // did we just spawn a lot of," not a permanent record.
+  const recency=teams[team].spawnRecency;
+
+  for(const k in recency)
+    recency[k]*=.88;
+
   const base=findBase(team);
 
   if(!base)
@@ -3473,63 +4340,47 @@ function commanderAI(team,dt){
     }
   }
 
-  // Kit out an un-suited, un-upgraded marksman with a ghillie
-  // suit whenever funds allow — makes them far harder to spot in
-  // cover. Any marksman can get one, not just fresh spawns.
-  // Mutually exclusive with Laser Sights below.
-  const bareMarksmen=units.filter(
-    u=>u.team===team&&
-       u.type==="marksman"&&
-       u.hp>0&&
-       !u.ghillie&&
-       !u.laserSights
-  );
+  // Longer engineering projects: mortar (1 day), armored vehicle
+  // (2 days), or a marksman upgrade kit (ghillie suit or laser
+  // sights) — same construction/readyTime pattern, just cheaper
+  // and faster since it's a single-unit item, not a whole new
+  // asset. On completion (see processTeamTimers), an upgrade kit
+  // doesn't apply itself — it gets handed to an available Supplier
+  // to physically carry out and deliver.
+  if(!teams[team].construction&&rand()<.3){
 
-  if(
-    bareMarksmen.length&&
-    teams[team].res>=20&&
-    rand()<.3
-  ){
+    const roll=rand();
 
-    const m=
-      bareMarksmen[
-        Math.floor(rand()*bareMarksmen.length)
-      ];
+    let type,dur,cost;
 
-    m.ghillie=true;
-    teams[team].res-=20;
+    if(roll<.3){
+      type="mortar";dur=DAY*1;cost=90;
+    }else if(roll<.55){
+      type="vehicle";dur=DAY*2;cost=140;
+    }else if(roll<.8){
+      type="ghillie";dur=DAY*.4;cost=70;
+    }else{
+      type="laserSights";dur=DAY*.5;cost=90;
+    }
 
-    addChat(team,"Marksman kitted out in a ghillie suit.");
-  }
+    if(teams[team].res>=cost){
 
-  // Kit out a marksman with Laser Sights instead — trades away
-  // concealment (they're far more noticeable at range) for a
-  // longer effective range, guaranteed penetration through ruins
-  // and barriers, at the cost of a 1s stun whenever they're hit.
-  // Mutually exclusive with the Ghillie Suit above.
-  const unlasedMarksmen=units.filter(
-    u=>u.team===team&&
-       u.type==="marksman"&&
-       u.hp>0&&
-       !u.ghillie&&
-       !u.laserSights
-  );
+      teams[team].res-=cost;
 
-  if(
-    unlasedMarksmen.length&&
-    teams[team].res>=30&&
-    rand()<.3
-  ){
+      teams[team].construction={
+        type,
+        readyTime:gameTime+dur
+      };
 
-    const m=
-      unlasedMarksmen[
-        Math.floor(rand()*unlasedMarksmen.length)
-      ];
-
-    m.laserSights=true;
-    teams[team].res-=30;
-
-    addChat(team,"Marksman kitted out with Laser Sights.");
+      addChat(
+        team,
+        "Engineers starting a "+
+        (type==="ghillie"?"ghillie suit kit":
+         type==="laserSights"?"laser sights kit":
+         type)+
+        "."
+      );
+    }
   }
 
   // Radio a resupply request — any infantry with a working radio
@@ -3583,6 +4434,67 @@ function commanderAI(team,dt){
       team,
       "Requesting resupply — chopper's inbound, over."
     );
+  }
+
+  // Airstrike call-in — a deliberate, expensive area-denial tool
+  // that sits alongside mortars rather than replacing them, so it
+  // deliberately isn't cheap or spammable: 200 resources up front,
+  // locked out for the first 60s of the match, and another 60s
+  // cooldown after every use (measured from when the bomb actually
+  // lands, not from the call itself — the plane still has to fly
+  // in). Only one in flight per team at a time, same as the
+  // resupply chopper.
+  if(
+    !teams[team].pendingAirstrike&&
+    gameTime>=teams[team].airstrikeReadyTime&&
+    teams[team].res>=200&&
+    hasComms(team)&&
+    rand()<.2
+  ){
+
+    const target=findDenseEnemyPoint(team);
+
+    if(target){
+
+      teams[team].res-=200;
+
+      let spawnX=W/2,spawnY=H/2,tries=0;
+
+      do{
+
+        spawnX=140+rand()*(W-280);
+        spawnY=140+rand()*(H-280);
+        tries++;
+
+      }while(
+        (terrainAt(spawnX,spawnY)==="water"||
+         Math.hypot(spawnX-target.x,spawnY-target.y)<1000)&&
+        tries<20
+      );
+
+      const dist=
+        Math.hypot(
+          spawnX-target.x,
+          spawnY-target.y
+        );
+
+      airstrikePlanes.push({
+        id:nextId++,
+        team,
+        x:spawnX,
+        y:spawnY,
+        targetX:target.x,
+        targetY:target.y,
+        speed:dist/14
+      });
+
+      teams[team].pendingAirstrike=true;
+
+      addChat(
+        team,
+        "Airstrike called in, danger close — fire in the hole."
+      );
+    }
   }
 
   // Engineers build defensive positions and run longer
@@ -3729,41 +4641,6 @@ function commanderAI(team,dt){
         addChat(team,"Engineers laying a mine.");
       }
     }
-
-    // Longer engineering projects: mortar (1 day), armored
-    // vehicle (2 days), or a new weapon shipment (5 days).
-    if(
-      !teams[team].construction&&
-      teams[team].res>=170&&
-      rand()<.3
-    ){
-
-      const roll=rand();
-
-      let type,dur,cost;
-
-      if(roll<.4){
-        type="mortar";dur=DAY*1;cost=90;
-      }else if(roll<.8){
-        type="vehicle";dur=DAY*2;cost=140;
-      }else{
-        type="weapon";dur=DAY*5;cost=160;
-      }
-
-      teams[team].res-=cost;
-
-      teams[team].construction={
-        type,
-        readyTime:gameTime+dur
-      };
-
-      addChat(
-        team,
-        "Engineers starting a "+
-        (type==="weapon"?"new weapon program":type)+
-        "."
-      );
-    }
   }
 }
 
@@ -3861,14 +4738,42 @@ function processTeamTimers(){
       const c=T.construction;
       const base=findBase(team);
 
-      if(c.type==="weapon"){
+      if(c.type==="ghillie"||c.type==="laserSights"){
 
-        T.weaponTier++;
-
-        addChat(
-          team,
-          "New weapon shipment fielded."
+        // Doesn't apply itself — gets handed to an available
+        // Supplier to physically carry out and deliver (see the
+        // supplier behavior block in updateUnitAI). If none is
+        // free right now, it waits in the team's queue for the
+        // next Supplier that opens up. If that Supplier dies
+        // while carrying it, the upgrade — and the resources
+        // spent on it — are simply gone, no refund, no
+        // reassignment.
+        const supplier=units.find(
+          u=>u.team===team&&
+             u.type==="supplier"&&
+             u.hp>0&&
+             !u.critical&&
+             !u.carryingUpgrade
         );
+
+        if(supplier){
+
+          supplier.carryingUpgrade=c.type;
+
+          addChat(
+            team,
+            "Upgrade ready — a supplier's carrying it out."
+          );
+
+        }else{
+
+          T.pendingUpgrades.push(c.type);
+
+          addChat(
+            team,
+            "Upgrade ready, waiting on a free supplier."
+          );
+        }
 
       }else if(base){
 
@@ -3931,6 +4836,68 @@ function updateChoppers(dt){
 }
 
 
+function updateAirstrikePlanes(dt){
+
+  // Flies in from a random point on the map (at least 1000px from
+  // the target, so it isn't just spawning on top of the blast) to
+  // the commander AI's chosen point, then drops its bomb — no
+  // in-flight shoot-down mechanic, unlike the resupply chopper;
+  // this is fire-and-forget once called.
+  for(let i=airstrikePlanes.length-1;i>=0;i--){
+
+    const p=airstrikePlanes[i];
+
+    const dx=p.targetX-p.x;
+    const dy=p.targetY-p.y;
+    const d=Math.hypot(dx,dy);
+
+    if(d<40){
+
+      // Same falloff-by-distance blast as a mine, scaled up, and
+      // just as indiscriminate — no team filter, hits anyone
+      // caught in range. Same known gap as every other explosion
+      // in the game: doesn't yet account for building walls.
+      const blastR=250;
+
+      for(const v of units){
+
+        if(v.hp<=0&&!v.critical)
+          continue;
+
+        const bd=Math.hypot(v.x-p.targetX,v.y-p.targetY);
+
+        if(bd<blastR){
+
+          const falloff=Math.max(0,1-bd/blastR);
+          damageUnit(v,100*falloff,null);
+        }
+      }
+
+      spawnParticles(p.targetX,p.targetY,"#ffb347",16);
+      spawnParticles(p.targetX,p.targetY,"#ff5a3d",10);
+      spawnParticles(p.targetX,p.targetY,"#8a8a82",8);
+      spawnBlastRing(p.targetX,p.targetY,blastR,"#ff6a3d");
+
+      // The cooldown starts now — from the bomb actually landing —
+      // not from when the strike was called in.
+      teams[p.team].airstrikeReadyTime=gameTime+60;
+      teams[p.team].pendingAirstrike=null;
+
+      addChat(p.team,"Bombs away — target hit, over.");
+
+      airstrikePlanes.splice(i,1);
+      continue;
+    }
+
+    const vx=dx/(d||1);
+    const vy=dy/(d||1);
+
+    p.x+=vx*p.speed*dt;
+    p.y+=vy*p.speed*dt;
+  }
+}
+
+
 // Releases a drone's operator from the freeze — called whenever a
 // drone is destroyed, whether it detonated on contact or got shot
 // down. The engineer stays frozen a moment longer (see
@@ -3979,6 +4946,7 @@ function detonateKamikazeDrone(d,indiscriminate=false){
 
   spawnParticles(d.x,d.y,"#ffb347",10);
   spawnParticles(d.x,d.y,"#ff5a3d",6);
+  spawnBlastRing(d.x,d.y,blastR,"#ffb347");
 
   releaseDroneOperator(d);
 }
@@ -4284,6 +5252,92 @@ function updateRescues(dt){
 }
 
 
+// How close a unit needs to be to a Supplier for a field resupply
+// to start — same spirit as MEDIC_REVIVE_RANGE.
+const SUPPLIER_RESUPPLY_RANGE=70;
+
+
+function updateSupplyDeliveries(dt){
+
+  // Timed field ammo transfer — mirrors the medic critical-revive
+  // pattern exactly: a receiving unit accumulates progress every
+  // frame while a Supplier holds position in range, and the
+  // transfer resolves once that reaches the required duration
+  // (3-7s, scaled by how much reserve is actually missing — a
+  // near-empty reserve takes the full 7s, a nearly-full one barely
+  // any time at all).
+  for(const v of units){
+
+    if(v.hp<=0||v.critical){
+
+      v.resupplyProgress=0;
+      v.resupplyRequired=undefined;
+      v.beingResupplied=false;
+      continue;
+    }
+
+    if(v.reserve>=TYPES[v.type].reserveSize){
+
+      v.resupplyProgress=0;
+      v.resupplyRequired=undefined;
+      v.beingResupplied=false;
+      continue;
+    }
+
+    let supplier=null;
+
+    for(const s of units){
+
+      if(
+        s!==v&&
+        s.type==="supplier"&&
+        s.team===v.team&&
+        s.hp>0&&
+        !s.critical&&
+        s.ammoPack>0&&
+        Math.hypot(s.x-v.x,s.y-v.y)<SUPPLIER_RESUPPLY_RANGE
+      ){
+        supplier=s;
+        break;
+      }
+    }
+
+    v.beingResupplied=!!supplier;
+
+    if(!supplier)
+      continue;
+
+    if(v.resupplyRequired===undefined){
+
+      const deficit=TYPES[v.type].reserveSize-v.reserve;
+      const fraction=deficit/TYPES[v.type].reserveSize;
+
+      v.resupplyRequired=3+fraction*4;
+    }
+
+    v.resupplyProgress+=dt;
+
+    if(v.resupplyProgress>=v.resupplyRequired){
+
+      // Recomputed fresh at the moment of transfer (rather than
+      // reusing whatever was true when the timer started) so it's
+      // always correct even if a different Supplier picked up the
+      // job partway through, or this one made other deliveries
+      // in the meantime.
+      const deficit=TYPES[v.type].reserveSize-v.reserve;
+      const amount=Math.min(deficit,supplier.ammoPack);
+
+      v.reserve+=amount;
+      supplier.ammoPack=Math.max(0,supplier.ammoPack-amount);
+
+      v.resupplyProgress=0;
+      v.resupplyRequired=undefined;
+      v.beingResupplied=false;
+    }
+  }
+}
+
+
 function updateMines(dt){
 
   // Obscured to the enemy — there's no avoidance/detection AI
@@ -4345,6 +5399,7 @@ function updateMines(dt){
 
     spawnParticles(m.x,m.y,"#ffb347",10);
     spawnParticles(m.x,m.y,"#ff5a3d",6);
+    spawnBlastRing(m.x,m.y,m.blastRadius,"#ffb347");
 
     mines.splice(i,1);
   }
@@ -4509,6 +5564,14 @@ function updateBullets(dt){
           "#eee",
           3
         );
+
+        if(b.explosive)
+          spawnBlastRing(
+            u.x,
+            u.y,
+            b.blastRadius||75,
+            b.blastFalloff?"#ff9a4d":"#ffcf6e"
+          );
 
         bullets.splice(i,1);
         hit=true;
@@ -4799,6 +5862,72 @@ function updateParticles(dt){
 
 
 /* =========================================================
+   BLAST RINGS
+   A visible ring drawn at an explosion's actual damage radius,
+   so splash weapons (mortar, grenadier, mines, kamikaze drones,
+   airstrikes) read clearly as "this is how far that just
+   reached" instead of only a small particle puff at the center.
+   Purely visual — has no effect on damage, which is already
+   resolved wherever spawnBlastRing() gets called from.
+========================================================= */
+
+function spawnBlastRing(x,y,radius,color="#ffb347"){
+
+  blastRings.push({
+    x,y,radius,color,
+    age:0,
+    duration:.45
+  });
+}
+
+
+function updateBlastRings(dt){
+
+  for(let i=blastRings.length-1;i>=0;i--){
+
+    const b=blastRings[i];
+
+    b.age+=dt;
+
+    if(b.age>=b.duration)
+      blastRings.splice(i,1);
+  }
+}
+
+
+function drawBlastRings(){
+
+  for(const b of blastRings){
+
+    const t=clamp(b.age/b.duration,0,1);
+
+    // Quick outward pop from ~35% of the radius up to the full
+    // blast radius, fading out as it goes — reads as a shockwave
+    // that shows exactly how far the blast reached.
+    const rr=b.radius*(.35+.65*t);
+    const alpha=1-t;
+
+    ctx.save();
+
+    ctx.globalAlpha=alpha*.18;
+    ctx.fillStyle=b.color;
+    ctx.beginPath();
+    ctx.arc(b.x,b.y,rr,0,Math.PI*2);
+    ctx.fill();
+
+    ctx.globalAlpha=alpha*.9;
+    ctx.strokeStyle=b.color;
+    ctx.lineWidth=3;
+    ctx.beginPath();
+    ctx.arc(b.x,b.y,rr,0,Math.PI*2);
+    ctx.stroke();
+
+    ctx.restore();
+  }
+}
+
+
+/* =========================================================
    CLEANUP
 ========================================================= */
 
@@ -4887,6 +6016,30 @@ function simulationStep(){
     if(u.stunned>0)
       u.stunned=Math.max(0,u.stunned-SIM_STEP);
 
+    if(u.meleeCd>0)
+      u.meleeCd=Math.max(0,u.meleeCd-SIM_STEP);
+
+    if(u.recentlyStabbedTimer>0)
+      u.recentlyStabbedTimer=Math.max(0,u.recentlyStabbedTimer-SIM_STEP);
+
+    if(u.reloading){
+
+      u.reloadTimer-=SIM_STEP;
+
+      if(u.reloadTimer<=0){
+
+        const t=TYPES[u.type];
+        const needed=t.magSize-u.mag;
+        const drawn=Math.min(needed,u.reserve);
+
+        u.mag+=drawn;
+        u.reserve-=drawn;
+        u.reloading=false;
+        u.reloadTimer=0;
+        u.lastReloadTime=gameTime;
+      }
+    }
+
     updateUnitAI(
       u,
       SIM_STEP
@@ -4901,11 +6054,15 @@ function simulationStep(){
   updateFlags(SIM_STEP);
   updateBullets(SIM_STEP);
   updateParticles(SIM_STEP);
+  updateBlastRings(SIM_STEP);
   updateChoppers(SIM_STEP);
+  updateAirstrikePlanes(SIM_STEP);
   updateKamikazeDrones(SIM_STEP);
   updateDroneOperators(SIM_STEP);
   updateLeaderFollowDwell(SIM_STEP);
   updateRescues(SIM_STEP);
+  updateSupplyDeliveries(SIM_STEP);
+  updateBleeding(SIM_STEP);
   updateMines(SIM_STEP);
 
   cleanup();
@@ -5597,7 +6754,32 @@ function drawBuilding(s){
    UNIT DRAWING
 ========================================================= */
 
-function drawUnitIcon(c,type,team,ghillie,laser){
+function drawMeleeKnife(c){
+
+  // Simple fighting knife — steel blade forward, dark grip
+  // behind — drawn in place of a melee-eligible unit's normal
+  // weapon whenever u.order==="melee". Swaps back to the regular
+  // weapon automatically the instant order changes, since this is
+  // just a live read of current state each frame, not a separate
+  // animation to reset.
+  c.fillStyle="#d8d8d8";
+  c.strokeStyle="#111";
+  c.lineWidth=1.5;
+
+  c.beginPath();
+  c.moveTo(6,-2);
+  c.lineTo(24,0);
+  c.lineTo(6,2);
+  c.closePath();
+  c.fill();
+  c.stroke();
+
+  c.fillStyle="#3d2c17";
+  c.fillRect(0,-3,7,6);
+}
+
+
+function drawUnitIcon(c,type,team,ghillie,laser,melee){
 
   // Draws just the colored body + weapon/role icon, centered at
   // the origin, facing +X (0 radians). Shared by the live-game
@@ -5636,7 +6818,11 @@ function drawUnitIcon(c,type,team,ghillie,laser){
   if(type==="rifleman"){
 
     c.fillRect(-7,-9,14,18);
-    c.fillRect(3,-3,22,5); // rifle
+
+    if(melee)
+      drawMeleeKnife(c);
+    else
+      c.fillRect(3,-3,22,5); // rifle
 
   }else if(type==="mg"){
 
@@ -5672,9 +6858,13 @@ function drawUnitIcon(c,type,team,ghillie,laser){
 
     c.fillRect(-4,-4,8,8);
 
-    // sidearm/rifle slung forward
+    // sidearm/rifle slung forward (or a knife, in melee mode)
     c.fillStyle="#f0f0df";
-    c.fillRect(4,-2,18,5);
+
+    if(melee)
+      drawMeleeKnife(c);
+    else
+      c.fillRect(4,-2,18,5);
 
   }else if(type==="marksman"){
 
@@ -5748,11 +6938,14 @@ function drawUnitIcon(c,type,team,ghillie,laser){
 
     c.fill();
 
-    c.fillRect(
-      0,-15,
-      18,
-      6
-    ); // launcher tube
+    if(melee)
+      drawMeleeKnife(c);
+    else
+      c.fillRect(
+        0,-15,
+        18,
+        6
+      ); // launcher tube
 
   }else if(type==="comms"){
 
@@ -5845,6 +7038,32 @@ function drawUnitIcon(c,type,team,ghillie,laser){
     c.stroke();
 
     c.lineWidth=2;
+
+  }else if(type==="supplier"){
+
+    c.fillRect(-9,-9,18,18);
+
+    // ammo crate slung on the back
+    c.fillStyle="#7a5a2e";
+
+    c.fillRect(-16,-9,10,18);
+
+    c.strokeStyle="#3d2c17";
+    c.lineWidth=1.5;
+    c.strokeRect(-16,-9,10,18);
+
+    c.beginPath();
+    c.moveTo(-16,-2);
+    c.lineTo(-6,-2);
+    c.moveTo(-16,4);
+    c.lineTo(-6,4);
+    c.stroke();
+
+    // sidearm
+    c.fillStyle="#f0f0df";
+    c.strokeStyle="#111";
+    c.lineWidth=2;
+    c.fillRect(6,-2,12,4);
   }
 }
 
@@ -5925,7 +7144,7 @@ function drawUnit(u){
 
   ctx.stroke();
 
-  drawUnitIcon(ctx,u.type,u.team,u.ghillie,u.laserSights);
+  drawUnitIcon(ctx,u.type,u.team,u.ghillie,u.laserSights,u.order==="melee");
 
   ctx.restore();
 
@@ -5939,7 +7158,7 @@ function drawUnit(u){
     4
   );
 
-  ctx.fillStyle="#70df68";
+  ctx.fillStyle=u.bleeding?"#ff4d4d":"#70df68";
 
   ctx.fillRect(
     -15,
@@ -5952,6 +7171,67 @@ function drawUnit(u){
       ),
     4
   );
+
+  // Ammo readout — visible the whole time a unit is mid-reload
+  // (so the mechanic is actually visible while it's happening),
+  // then lingers for a couple seconds afterward showing the
+  // refreshed count before fading back out, rather than
+  // permanently cluttering every unit on screen with numbers.
+  const sinceReload=gameTime-u.lastReloadTime;
+  const showAmmo=u.reloading||sinceReload<2.5;
+
+  if(showAmmo){
+
+    const ammoAlpha=
+      u.reloading?
+      1:
+      clamp(1-sinceReload/2.5,0,1);
+
+    ctx.save();
+
+    ctx.globalAlpha=ammoAlpha;
+    ctx.fillStyle=u.reloading?"#ffcf6e":"#e8e8dc";
+    ctx.font="10px sans-serif";
+    ctx.textAlign="center";
+
+    ctx.fillText(
+      u.mag+"/"+u.reserve,
+      0,
+      -t.radius-13
+    );
+
+    ctx.restore();
+  }
+
+  // Carrying-upgrade indicator — a Supplier physically hauling a
+  // finished upgrade kit gets a small marker so it reads
+  // differently from one that's just out running ammo. Doesn't
+  // say which upgrade, just that it's carrying something.
+  if(u.type==="supplier"&&u.carryingUpgrade){
+
+    ctx.save();
+    ctx.translate(t.radius+3,-t.radius-3);
+
+    ctx.fillStyle="#ffd66e";
+    ctx.strokeStyle="#5a4110";
+    ctx.lineWidth=1;
+
+    ctx.beginPath();
+    ctx.arc(0,0,6,0,Math.PI*2);
+    ctx.fill();
+    ctx.stroke();
+
+    ctx.lineWidth=1.5;
+
+    ctx.beginPath();
+    ctx.moveTo(-3,0);
+    ctx.lineTo(3,0);
+    ctx.moveTo(0,-3);
+    ctx.lineTo(0,3);
+    ctx.stroke();
+
+    ctx.restore();
+  }
 
   ctx.restore();
 }
@@ -6033,6 +7313,79 @@ function drawChopper(c){
     30*clamp(c.hp/c.maxhp,0,1),
     4
   );
+}
+
+
+/* =========================================================
+   AIRSTRIKE PLANE DRAWING
+========================================================= */
+
+function drawAirstrikePlane(p){
+
+  // A target reticle at the impact point for the whole flight, so
+  // the incoming strike reads as a threat worth reacting to, not
+  // just a silent plane crossing the map.
+  const pulse=
+    .6+Math.sin(gameTime*6)*.4;
+
+  ctx.strokeStyle=
+    p.team===BLUE?
+    "#3d8cff":
+    "#ff4d55";
+
+  ctx.globalAlpha=pulse;
+  ctx.lineWidth=2;
+
+  ctx.beginPath();
+  ctx.arc(p.targetX,p.targetY,26,0,Math.PI*2);
+  ctx.stroke();
+
+  ctx.beginPath();
+  ctx.moveTo(p.targetX-34,p.targetY);
+  ctx.lineTo(p.targetX-14,p.targetY);
+  ctx.moveTo(p.targetX+14,p.targetY);
+  ctx.lineTo(p.targetX+34,p.targetY);
+  ctx.moveTo(p.targetX,p.targetY-34);
+  ctx.lineTo(p.targetX,p.targetY-14);
+  ctx.moveTo(p.targetX,p.targetY+14);
+  ctx.lineTo(p.targetX,p.targetY+34);
+  ctx.stroke();
+
+  ctx.globalAlpha=1;
+
+  ctx.save();
+
+  ctx.translate(p.x,p.y);
+
+  const angle=Math.atan2(
+    p.targetY-p.y,
+    p.targetX-p.x
+  );
+
+  ctx.rotate(angle);
+
+  const bodyColor=
+    p.team===BLUE?
+    "#2f4d63":
+    "#5c3336";
+
+  // wings
+  ctx.fillStyle=bodyColor;
+  ctx.fillRect(-4,-22,7,44);
+
+  // fuselage
+  ctx.beginPath();
+  ctx.ellipse(0,0,20,5,0,0,Math.PI*2);
+  ctx.fill();
+
+  ctx.strokeStyle="#111";
+  ctx.lineWidth=1.2;
+  ctx.stroke();
+
+  // tail fin
+  ctx.fillRect(-20,-10,5,12);
+
+  ctx.restore();
 }
 
 
@@ -6185,7 +7538,19 @@ function draw(){
   // tree lines behind everything
   drawTrees();
 
-  // flags
+  // trenches first
+  for(const s of structures)
+    if(s.kind==="trench")
+      drawTrench(s);
+
+  // buildings
+  for(const s of structures)
+    if(s.kind!=="trench")
+      drawBuilding(s);
+
+  // flags — drawn after buildings/trenches so a flag planted near
+  // or inside a building's footprint renders on top of it, not
+  // hidden underneath.
   for(const f of flags){
 
     ctx.strokeStyle=
@@ -6254,16 +7619,6 @@ function draw(){
     }
   }
 
-  // trenches first
-  for(const s of structures)
-    if(s.kind==="trench")
-      drawTrench(s);
-
-  // buildings
-  for(const s of structures)
-    if(s.kind!=="trench")
-      drawBuilding(s);
-
   // units
   for(const u of units)
     drawUnit(u);
@@ -6271,6 +7626,10 @@ function draw(){
   // resupply choppers
   for(const c of choppers)
     drawChopper(c);
+
+  // airstrike planes
+  for(const p of airstrikePlanes)
+    drawAirstrikePlane(p);
 
   // kamikaze drones
   for(const kd of kamikazeDrones)
@@ -6326,6 +7685,9 @@ function draw(){
   }
 
   ctx.globalAlpha=1;
+
+  // blast rings — visible extent of every explosion this frame
+  drawBlastRings();
 
   ctx.restore();
 
@@ -6416,6 +7778,18 @@ function drawMinimap(){
     mctx.fillRect(
       c.x*sx-2,
       c.y*sy-2,
+      4,
+      4
+    );
+  }
+
+  for(const p of airstrikePlanes){
+
+    mctx.fillStyle="#e8e8e8";
+
+    mctx.fillRect(
+      p.x*sx-2,
+      p.y*sy-2,
       4,
       4
     );
@@ -6712,11 +8086,13 @@ function reset(){
   structures=[];
   bullets=[];
   particles=[];
+  blastRings=[];
   flags=[];
   trees=[];
   choppers=[];
   kamikazeDrones=[];
   mines=[];
+  airstrikePlanes=[];
 
   nextId=1;
   gameTime=0;
@@ -6726,7 +8102,6 @@ function reset(){
     res:650,
     score:0,
     aiTimer:0,
-    weaponTier:0,
     construction:null,
     pendingSupply:null,
     commsTimer:3+rand()*3,
@@ -6735,14 +8110,17 @@ function reset(){
     lastReportUnits:0,
     followFocus:"balanced",
     totalKills:0,
-    casualties:0
+    casualties:0,
+    airstrikeReadyTime:gameTime+60,
+    pendingAirstrike:null,
+    pendingUpgrades:[],
+    spawnRecency:{}
   };
 
   teams[RED]={
     res:650,
     score:0,
     aiTimer:0,
-    weaponTier:0,
     construction:null,
     pendingSupply:null,
     commsTimer:3+rand()*3,
@@ -6751,7 +8129,11 @@ function reset(){
     lastReportUnits:0,
     followFocus:"balanced",
     totalKills:0,
-    casualties:0
+    casualties:0,
+    airstrikeReadyTime:gameTime+60,
+    pendingAirstrike:null,
+    pendingUpgrades:[],
+    spawnRecency:{}
   };
 
   teamChat=[[],[]];
@@ -7038,20 +8420,24 @@ const ASSET_INFO=[
   },
   {
     name:"Ghillie Suit (Marksman upgrade)",
-    blurb:"Engineers can spend 30 material to kit out an "+
-      "un-suited marksman with a ghillie suit — with the mottled "+
-      "camo pattern, it takes just one nearby tree to be concealed "+
-      "(instead of two), and it's only spottable up close."
+    blurb:"Engineers queue this as a construction project (70 "+
+      "material). On completion it doesn't apply itself — it gets "+
+      "handed to an available Supplier, who has to physically "+
+      "reach an eligible marksman to deliver it. If that Supplier "+
+      "dies while carrying it, the upgrade is lost for good. Once "+
+      "delivered: with the mottled camo pattern, it takes just one "+
+      "nearby tree to be concealed (instead of two), and it's only "+
+      "spottable up close."
   },
   {
     name:"Laser Sights (Marksman upgrade)",
-    blurb:"Engineers can spend 30 material to kit out a marksman "+
-      "with Laser Sights instead — mutually exclusive with the "+
-      "Ghillie Suit. It stretches their effective range and lets "+
-      "shots punch straight through building walls and barriers "+
-      "with no chance of being blocked, at the cost of being far "+
-      "more noticeable at a distance and a 1s stun every time "+
-      "they're hit."
+    blurb:"Same construction-then-Supplier-delivery process as the "+
+      "Ghillie Suit (90 material), and mutually exclusive with it "+
+      "— a marksman can only ever be carrying one. Once delivered: "+
+      "stretches their effective range and lets shots punch "+
+      "straight through building walls and barriers with no chance "+
+      "of being blocked, at the cost of being far more noticeable "+
+      "at a distance and a 1s stun every time they're hit."
   },
   {
     name:"Barriers (Walls)",
@@ -7078,6 +8464,50 @@ const ASSET_INFO=[
     blurb:"Mortar shells now explode on impact with a real blast "+
       "radius — full damage right at the point of impact, tapering "+
       "off the further away a unit is, out to the edge of the blast."
+  },
+  {
+    name:"Airstrike Call-in",
+    blurb:"A deliberate, expensive area-denial strike, separate "+
+      "from mortars rather than a replacement for them. Needs a "+
+      "working radio, 200 resources spent the moment it's called, "+
+      "and is locked out for the first 60s of the match and for "+
+      "60s after every use — measured from when the bomb actually "+
+      "lands, since the plane still has to fly in first. The "+
+      "commander picks wherever the enemy is currently clustered "+
+      "thickest, and only one strike can be in flight per team at "+
+      "a time. The blast is wide (250 radius) and hits both sides "+
+      "with no team filter, so calling one in near your own troops "+
+      "is a real risk, not just the enemy's problem."
+  },
+  {
+    name:"Ammo, Reload & Running Dry",
+    blurb:"Every unit carries a magazine and a separate reserve — "+
+      "firing draws from the magazine, and it automatically "+
+      "reloads from reserve once empty (a real pause on top of "+
+      "the normal rate of fire, not instead of it). A unit whose "+
+      "reserve is also empty can't fire at all. Support and "+
+      "defense roles (medic, comms, engineer, supplier, mg, and a "+
+      "leader that isn't actively rushing) fall back toward help "+
+      "when that happens, same as running low on health. A "+
+      "rusher or capturer (rifleman, grenadier, or a leader that "+
+      "is actively rushing) stands its ground empty-handed "+
+      "instead — vehicles always fall back, having no infantry "+
+      "melee option. Watch a unit's ammo count above its health "+
+      "bar while it's reloading to see this in action."
+  },
+  {
+    name:"Supplier",
+    blurb:"A lightly-armed logistics unit carrying a 1000-round "+
+      "field pack. Any ally that reaches one gets its reserve "+
+      "topped up over 3-7s, depending on how much is actually "+
+      "missing. Once its own pack runs dry, it immediately breaks "+
+      "off and heads for the nearest HQ, barracks, or bunker, "+
+      "refilling instantly there — a depot has effectively "+
+      "unlimited logistics, a field handoff between two soldiers "+
+      "doesn't. A Supplier hauling a finished upgrade kit (see "+
+      "Ghillie Suit / Laser Sights) shows a small gold marker and "+
+      "prioritizes delivering it over routine ammo runs — but if "+
+      "it dies first, the upgrade is lost for good."
   },
   {
     name:"Critical Failure & Rescue",
@@ -7124,6 +8554,7 @@ function buildStatsPanel(){
   const critical=[0,0];
   const moraleSum=[0,0];
   const moraleN=[0,0];
+  const outOfAmmoCount=[0,0];
 
   for(const u of units){
 
@@ -7135,6 +8566,9 @@ function buildStatsPanel(){
 
     if(u.critical)
       critical[u.team]++;
+
+    if(isOutOfAmmo(u))
+      outOfAmmoCount[u.team]++;
 
     moraleSum[u.team]+=u.morale;
     moraleN[u.team]++;
@@ -7215,7 +8649,7 @@ function buildStatsPanel(){
     ["Sectors held",sectors[BLUE],sectors[RED]],
     ["Total kills",teams[BLUE].totalKills,teams[RED].totalKills],
     ["Casualties",teams[BLUE].casualties,teams[RED].casualties],
-    ["Weapon tier",teams[BLUE].weaponTier,teams[RED].weaponTier],
+    ["Out of ammo",outOfAmmoCount[BLUE],outOfAmmoCount[RED]],
     ["Buildings owned",buildingsOwned[BLUE],buildingsOwned[RED]],
     ["Downed (critical)",critical[BLUE],critical[RED]],
     ["Avg. morale",avgMorale[BLUE]+"%",avgMorale[RED]+"%"],
