@@ -616,12 +616,12 @@ const teams=[
    commsTimer:3+rand()*3,commsPending:false,focus:"balanced",lastReportUnits:0,
    followFocus:"balanced",totalKills:0,casualties:0,
    airstrikeReadyTime:gameTime+60,pendingAirstrike:null,pendingUpgrades:[],
-   spawnRecency:{}},
+   spawnRecency:{},chopperReadyTime:0},
   {res:650,score:0,aiTimer:0,construction:null,pendingSupply:null,
    commsTimer:3+rand()*3,commsPending:false,focus:"balanced",lastReportUnits:0,
    followFocus:"balanced",totalKills:0,casualties:0,
    airstrikeReadyTime:gameTime+60,pendingAirstrike:null,pendingUpgrades:[],
-   spawnRecency:{}}
+   spawnRecency:{},chopperReadyTime:0}
 ];
 
 // A "day" in the simulation, used for engineer build/resupply timers.
@@ -681,7 +681,7 @@ const TYPES={
 
  medic:{
   cost:30,hp:80,speed:50,
-  range:75,damage:6,rate:1,
+  range:75,damage:5,rate:1,
   radius:14,
   magSize:12,reserveSize:24,reloadTime:1.5
  },
@@ -715,7 +715,7 @@ const TYPES={
 
  comms:{
   cost:50,hp:85,speed:43,
-  range:120,damage:7,rate:1,
+  range:120,damage:5,rate:1,
   radius:14,
   magSize:10,reserveSize:30,reloadTime:1.5
  },
@@ -746,6 +746,56 @@ const TYPES={
   range:110,damage:5,rate:1,
   radius:14,
   magSize:8,reserveSize:24,reloadTime:1.5
+ },
+
+ flamer:{
+  cost:60,hp:100,speed:58,
+  // "damage"/"rate" here are just for Field Manual display —
+  // Flamer doesn't fire discrete shots through shoot(), it
+  // sprays a persistent cone (see updateFlameEffects()). range
+  // doubles as the cone's reach.
+  range:150,damage:2,rate:1,
+  radius:15
+  // Deliberately no magSize/reserveSize/reloadTime — Flamer runs
+  // on a 30-point fuel tank instead (see Part 3 of the Pyromaniac
+  // update: isOutOfAmmo()/isMeleeEligible() both special-case this
+  // type to check fuel rather than the standard ammo fields).
+ },
+
+ // Pistol Wielding: 5 damage, 1s rate, same standardization as
+ // medic/comms/supplier above. Pilots a drone the same way an
+ // engineer used to pilot a kamikaze — see the generalized
+ // frozenByDrone/droneThaw mechanic and updateDroneOperators().
+ droneOperator:{
+  cost:45,hp:85,speed:46,
+  range:100,damage:5,rate:1,
+  radius:15,
+  magSize:8,reserveSize:24,reloadTime:1.5
+ },
+
+ // No weapon at all — damage:0, and excluded from shoot()/combat
+ // entirely (see the dedicated AI block). Reveals concealed
+ // enemies in its LOS (see updateScoutDroneReveals()) and
+ // contributes only half a "unit" toward flag capture (see
+ // updateFlags()).
+ scoutDrone:{
+  cost:20,hp:40,speed:62,
+  range:260,damage:0,rate:1,
+  radius:11
+ },
+
+ // 12-round magazine, no reserve and no reload — a single pool,
+ // same "no refill mechanic" shape as Flamer's fuel tank, just
+ // sized like a small clip instead of a time-based resource.
+ // Once it runs dry, isOutOfAmmo() naturally reads true forever
+ // (reserve is permanently 0) and the dedicated AI block switches
+ // it to kamikaze behavior instead of the standard retreat/melee
+ // branching every other out-of-ammo unit gets.
+ rifleDrone:{
+  cost:25,hp:60,speed:60,
+  range:200,damage:12,rate:.9,
+  radius:12,
+  magSize:12,reserveSize:0,reloadTime:0
  }
 
 };
@@ -770,6 +820,9 @@ const ROLE_BY_TYPE={
   vehicle:"rusher",
 
   grenadier:"capturer",
+  flamer:"rusher",
+  scoutDrone:"capturer",
+  rifleDrone:"rusher",
 
   mg:"defender",
   leader:"defender",
@@ -780,7 +833,8 @@ const ROLE_BY_TYPE={
   medic:"support",
   comms:"support",
   engineer:"support",
-  supplier:"support"
+  supplier:"support",
+  droneOperator:"support"
 };
 
 
@@ -987,6 +1041,34 @@ function buildTreeGrid(){
 }
 
 
+function removeTree(t){
+
+  // A stale entry left behind in treeGrid (the spatial hash used
+  // by treesNear() for concealment/LOS) would cause a destroyed
+  // tree to keep counting toward concealment forever, so this has
+  // to clean up both places a tree lives, not just the array.
+  const idx=trees.indexOf(t);
+
+  if(idx>=0)
+    trees.splice(idx,1);
+
+  const key=
+    Math.floor(t.x/TREE_CELL)+
+    ","+
+    Math.floor(t.y/TREE_CELL);
+
+  const bucket=treeGrid.get(key);
+
+  if(bucket){
+
+    const bIdx=bucket.indexOf(t);
+
+    if(bIdx>=0)
+      bucket.splice(bIdx,1);
+  }
+}
+
+
 function findDenseEnemyPoint(team){
 
   // Coarse grid-binning to find where the enemy is currently
@@ -1064,14 +1146,78 @@ function treesNear(x,y,radius){
 }
 
 
+function inTrench(u){
+
+  // Same own-team-only convention findCover() already uses for
+  // cover-seeking — an enemy trench doesn't protect you.
+  for(const s of structures){
+
+    if(
+      s.kind==="trench"&&
+      s.team===u.team&&
+      Math.hypot(u.x-s.x,u.y-s.y)<s.r
+    )
+      return true;
+  }
+
+  return false;
+}
+
+
 function isConcealed(u){
 
   // A unit tucked against a few trees is much harder to spot —
   // this is what lets a marksman hide in the treeline. A
   // ghillie-suited marksman blends in with just a single tree.
+  // Standing in a trench adds one more point toward that same
+  // count rather than needing a separate concealment path.
   const needed=u.ghillie?1:2;
 
-  return treesNear(u.x,u.y,26)>=needed;
+  return treesNear(u.x,u.y,26)+(inTrench(u)?1:0)>=needed;
+}
+
+
+// Scout Drone concealment reveal (Part 4 of the Drone Operator
+// overhaul) — a persistent override layered on top of
+// isConcealed()'s pure, stateless tree-proximity check. Any enemy
+// currently in a Scout Drone's line of sight has revealedUntil
+// continuously refreshed 10 seconds into the future; since that's
+// well past the "doesn't resume until 3 seconds after leaving
+// sight" floor the spec also calls for, one refreshed timestamp
+// satisfies both numbers without needing two separate timers.
+const SCOUT_REVEAL_DURATION=10;
+
+function updateScoutDroneReveals(){
+
+  for(const s of units){
+
+    if(s.type!=="scoutDrone"||s.hp<=0)
+      continue;
+
+    for(const v of units){
+
+      if(
+        v.team===s.team||
+        v.hp<=0||
+        v.critical
+      )
+        continue;
+
+      if(Math.hypot(s.x-v.x,s.y-v.y)>TYPES.scoutDrone.range)
+        continue;
+
+      if(!hasLineOfSight(s,v))
+        continue;
+
+      v.revealedUntil=gameTime+SCOUT_REVEAL_DURATION;
+    }
+  }
+}
+
+
+function isRevealed(u){
+
+  return gameTime<u.revealedUntil;
 }
 
 
@@ -1246,9 +1392,7 @@ function makeTrenchLine(team,x1,y1,x2,y2){
       x:x+(rand()-.5)*8,
       y:y+(rand()-.5)*8,
       angle,
-      r:34,
-      hp:220,
-      maxhp:220
+      r:34
     });
   }
 
@@ -1259,9 +1403,7 @@ function makeTrenchLine(team,x1,y1,x2,y2){
     x:(x1+x2)/2,
     y:(y1+y2)/2,
     angle:Math.atan2(y2-y1,x2-x1),
-    r:42,
-    hp:220,
-    maxhp:220
+    r:42
   });
 }
 
@@ -1310,9 +1452,7 @@ function digFieldTrench(team,x,y){
     team,
     x,y,
     angle,
-    r:32,
-    hp:190,
-    maxhp:190
+    r:32
   });
 }
 
@@ -1889,6 +2029,45 @@ function makeUnit(type,team,x,y){
     bleedTimeLeft:0,
     bleedTickTimer:0,
 
+    // Flamer's fuel tank (30, drained 1/sec while spraying) —
+    // replaces the standard magazine/reserve model entirely for
+    // this type. See updateFlameEffects(), the fuel-drain/refill
+    // block in simulationStep(), and isOutOfAmmo()/isMeleeEligible()
+    // which both special-case "flamer" to check this instead.
+    fuel:type==="flamer"?30:0,
+    spraying:false,
+    fuelRefillTimer:0,
+
+    // Flame contact tracking — any unit (not just Flamer targets)
+    // can stand in a cone. flameContactTime counts continuous
+    // seconds of current exposure, reset the instant contact
+    // breaks (see updateFlameEffects()). When contact ends,
+    // lastFlameContactDuration snapshots how long that exposure
+    // was and recentFlameContactTimer arms a short window during
+    // which starting a retreat triggers Burning (same pattern as
+    // recentlyStabbedTimer -> bleeding above).
+    flameContactTime:0,
+    lastFlameContactDuration:0,
+    recentFlameContactTimer:0,
+
+    // Read by moveUnit's speed de-buff tier — true only while
+    // actually standing inside an active cone this frame (see
+    // updateFlameEffects()), separate from the continuous
+    // flameContactTime counter above.
+    inFlameCone:false,
+
+    // Burning (self-inflicted, from retreating out of flame
+    // contact) and Inflicted Burning (contagion from a Burning
+    // unit brushing past) — both lethal, routed through the
+    // normal damageUnit() path, unlike bleed's hard floor. Full
+    // immunity to both for Flamer units themselves.
+    burning:false,
+    burnTimeLeft:0,
+    burnTickTimer:0,
+    inflictedBurning:false,
+    inflictedBurnTimeLeft:0,
+    inflictedBurnTickTimer:0,
+
     kills:0,
     brain:rand(),
 
@@ -1906,12 +2085,34 @@ function makeUnit(type,team,x,y){
     reviveRequired:undefined, // seconds needed to finish this particular revive
     beingHealed:false,// true this tick while a medic is actively working on a critical unit
 
-    // Drone operator lock — an engineer piloting a kamikaze drone
-    // (see the engineer build logic) freezes in place until the
-    // drone dies, then thaws out a second later. See
-    // updateDroneOperators().
+    // Drone operator lock — a Drone Operator piloting any of the
+    // three drone types (see the DO build logic in commanderAI)
+    // freezes in place until the drone dies, then thaws out a
+    // second later — unless Part 5's Inactive state cuts that
+    // short with an instant thaw instead (see damageUnit() and
+    // updateDroneOperators()).
     frozenByDrone:false,
     droneThaw:0,
+
+    // Set on a Scout/Rifle Drone unit to reference the Drone
+    // Operator piloting it — same convention the lightweight
+    // kamikazeDrones array already uses for its own .operator
+    // field, which is what lets detonateDrone()/releaseDroneOperator()
+    // treat all three drone types uniformly.
+    operator:null,
+
+    // True while this drone is in the Inactive state (see Part 5
+    // of the Drone Operator overhaul): stopped moving/attacking,
+    // but still present and destructible, after its DO took
+    // damage mid-flight. Cleared once the DO reaches Out of
+    // Danger and resumes control.
+    droneInactive:false,
+
+    // Scout Drone concealment reveal (see updateScoutDroneReveals()
+    // and the isConcealed() call site in nearestEnemy()) — while
+    // gameTime is under this timestamp, this unit is treated as
+    // spotted regardless of what isConcealed() itself would say.
+    revealedUntil:0,
 
     // Laser Sights (marksman upgrade) — see the engineer kit-out
     // logic and updateBullets(). Mutually exclusive with ghillie.
@@ -1986,56 +2187,67 @@ function nearestEnemy(u,range=Infinity,preferValue=false){
   let best=null;
   let bd=range;
 
-  for(const v of units){
+  // Shared unit-scanning pass, run twice below: once for live
+  // enemies only (hp>0 also excludes Critical Failure units,
+  // since their hp is pinned at 0), and — only if that pass comes
+  // up empty — once more allowing a downed enemy to be selected.
+  // "Finish off the downed" still happens, just never ahead of an
+  // actual live threat.
+  function scanUnits(onlyCritical){
 
-    // Fully-dead units are skipped as before, but a unit in
-    // Critical Failure (hp pinned at 0) can still be targeted —
-    // that's what lets the enemy finish off a downed casualty.
-    // Shelter behind a building's walls isn't a separate check
-    // here anymore — it falls straight out of the sightBlocked()
-    // call below, which tests per wall segment instead of one
-    // "fully inside = invisible" disc.
-    if(
-      v.team===u.team||
-      (v.hp<=0&&!v.critical)
-    )
-      continue;
+    for(const v of units){
 
-    // Concealed units (tucked in trees) are only spottable at
-    // much closer range — a marksman in a ghillie suit is even
-    // harder to spot than one without. Laser Sights is the
-    // opposite trade: the glint makes them noticeable from much
-    // farther away.
-    const effRange=
-      isConcealed(v)?
-      Math.min(
-        bd,
-        v.laserSights?230:(v.ghillie?90:150)
-      ):
-      bd;
-
-    const rawD=Math.hypot(u.x-v.x,u.y-v.y);
-
-    // A smarter commander doesn't just shoot the nearest body —
-    // support and command roles are worth closing extra distance
-    // for, so treat them as if they were closer than they are.
-    const d=
-      preferValue&&HIGH_VALUE_TYPES.includes(v.type)?
-      Math.max(0,rawD-70):
-      rawD;
-
-    if(d<effRange){
-
-      // Buildings AND tree lines block sight the same way they
-      // block bullets — units can't see (or shoot) through them.
-      // A Laser-Sighted shooter's view isn't blocked by ruins.
-      if(sightBlocked(u.x,u.y,v.x,v.y,u.laserSights))
+      if(v.team===u.team)
         continue;
 
-      bd=d;
-      best=v;
+      if(onlyCritical){
+        if(!v.critical)
+          continue;
+      }else{
+        if(v.hp<=0)
+          continue;
+      }
+
+      // Concealed units (tucked in trees) are only spottable at
+      // much closer range — a marksman in a ghillie suit is even
+      // harder to spot than one without. Laser Sights is the
+      // opposite trade: the glint makes them noticeable from much
+      // farther away. A unit currently revealed by an enemy Scout
+      // Drone loses that concealment entirely, regardless of trees.
+      const effRange=
+        isConcealed(v)&&!isRevealed(v)?
+        Math.min(
+          bd,
+          v.laserSights?230:(v.ghillie?90:150)
+        ):
+        bd;
+
+      const rawD=Math.hypot(u.x-v.x,u.y-v.y);
+
+      // A smarter commander doesn't just shoot the nearest body —
+      // support and command roles are worth closing extra distance
+      // for, so treat them as if they were closer than they are.
+      const d=
+        preferValue&&HIGH_VALUE_TYPES.includes(v.type)?
+        Math.max(0,rawD-70):
+        rawD;
+
+      if(d<effRange){
+
+        // Buildings AND tree lines block sight the same way they
+        // block bullets — units can't see (or shoot) through them.
+        // A Laser-Sighted shooter's view isn't blocked by ruins.
+        if(sightBlocked(u.x,u.y,v.x,v.y,u.laserSights))
+          continue;
+
+        bd=d;
+        best=v;
+      }
     }
   }
+
+  // Pass 1: live enemies only.
+  scanUnits(false);
 
   for(const s of structures){
 
@@ -2068,6 +2280,11 @@ function nearestEnemy(u,range=Infinity,preferValue=false){
       best=c;
     }
   }
+
+  // Pass 2: nothing at all was found in range — only now does a
+  // downed enemy become a valid target.
+  if(!best)
+    scanUnits(true);
 
   return best;
 }
@@ -2187,18 +2404,54 @@ function nearestSupplyDepot(team,x,y){
 }
 
 
+function nearestSupplier(team,x,y){
+
+  // Distinct from nearestSupplyDepot() above — Flamer's fuel tank
+  // refills specifically at a Supplier, not a structure. Reuses
+  // the flat instant-vs-gradual asymmetry logic already
+  // established for ammo (see the fuel-refill block in
+  // simulationStep()), just with a Supplier as the destination.
+  let best=null;
+  let bestD=Infinity;
+
+  for(const v of units){
+
+    if(
+      v.team!==team||
+      v.type!=="supplier"||
+      v.hp<=0||
+      v.critical
+    )
+      continue;
+
+    const d=Math.hypot(v.x-x,v.y-y);
+
+    if(d<bestD){
+      bestD=d;
+      best=v;
+    }
+  }
+
+  return best;
+}
+
 function isSafeSpot(u){
 
   // Replaces the old ruin-specific isSheltered(). There's no more
   // binary "inside = fully unhittable" flag — shelter behind a
   // building's walls now falls naturally out of correct
-  // per-segment line of sight instead. "Safe" here just means:
-  // near the team's own base, or not currently visible to any
-  // living enemy (which a wall, or just being out of anyone's
-  // sightline, both satisfy on their own).
+  // per-segment line of sight instead. "Safe" here means: near
+  // the team's own base, currently dug into a trench (which
+  // doesn't block LOS but now dodges most direct fire — without
+  // this, a unit could retreat into one and still be "seen," and
+  // never get to recover there), or simply not currently visible
+  // to any living enemy.
   const base=findBase(u.team);
 
   if(base&&Math.hypot(u.x-base.x,u.y-base.y)<120)
+    return true;
+
+  if(inTrench(u))
     return true;
 
   for(const v of units){
@@ -2238,7 +2491,10 @@ function nearestSafePoint(team,x,y,includeSuppliers=false){
 
   for(const s of structures){
 
-    if(s.kind!=="building")
+    if(s.kind!=="building"&&s.kind!=="trench")
+      continue;
+
+    if(s.kind==="trench"&&s.team!==team)
       continue;
 
     const d=Math.hypot(s.x-x,s.y-y);
@@ -2309,6 +2565,29 @@ function damageUnit(v,amount,source){
     v.stunned=1;
     v.goal=null;
     v.target=null;
+  }
+
+  // Part 5 of the Drone Operator overhaul: taking damage while
+  // actively piloting a drone instantly thaws the operator (not
+  // the usual 1s delayed droneThaw — this is immediate) and pauses
+  // the drone itself in an Inactive state. It stays fully present
+  // and destructible, just stops moving/attacking, until the
+  // operator reaches Out of Danger and resumes control (see
+  // updateDroneOperators()).
+  if(v.frozenByDrone){
+
+    const drone=findPilotedDrone(v);
+
+    if(drone){
+
+      v.frozenByDrone=false;
+      v.droneThaw=0;
+
+      if(drone.inactive!==undefined)
+        drone.inactive=true;
+      else
+        drone.droneInactive=true;
+    }
   }
 
   v.hp-=amount;
@@ -2434,9 +2713,16 @@ function isMeleeEligible(u){
   // Leader only while its current dynamic behavior is actively
   // rushing — same check chooseLeaderGoal()'s rush branch uses,
   // not its static "defender" role tag. Vehicle never gets melee,
-  // even though it's technically a rusher too.
+  // even though it's technically a rusher too. Flamer (also a
+  // capturer) only draws a knife once its fuel tank is actually
+  // empty — otherwise the close-quarters check below would make it
+  // abandon a still-working cone attack the instant an enemy
+  // closed to melee range, which defeats the point of the weapon.
   if(u.type==="vehicle")
     return false;
+
+  if(u.type==="flamer")
+    return u.fuel<=0;
 
   if(u.type==="leader"){
 
@@ -2457,7 +2743,15 @@ function resolveMeleeAttack(u,target){
 
   const stabRate=TYPES[u.type].stabRate||1.5;
 
-  if(rand()<MELEE_MISS_CHANCE){
+  // A trench fight at point-blank range is a much steadier stab
+  // than one in the open — but only when BOTH combatants are
+  // dug in, one side alone doesn't get the benefit.
+  const missChance=
+    inTrench(u)&&inTrench(target)?
+    .1:
+    MELEE_MISS_CHANCE;
+
+  if(rand()<missChance){
 
     // Wastes the attempt AND costs extra time on top of the
     // normal stab-rate cooldown.
@@ -2511,6 +2805,263 @@ function updateBleeding(dt){
 
     if(u.bleedTimeLeft<=0){
       u.bleeding=false;
+    }
+  }
+}
+
+
+// Flame tuning. Cone half-angle isn't spec'd exactly (range 140-160
+// is), so this is a starting value to tune around like the mortar
+// jitter/stab-rate constants were — wide enough to be a real area
+// weapon, narrow enough that it's still a forward-facing cone and
+// not an aura.
+const FLAME_CONE_HALF_ANGLE=.45;
+
+// "Touching" range for contagion/extinguish — same point-blank
+// spirit as MELEE_ENGAGE_RANGE.
+const FLAME_CONTACT_RANGE=45;
+
+const FLAME_TREE_BURN_TIME=10;
+const FLAME_RECENT_CONTACT_WINDOW=3;
+
+
+function updateFlameEffects(dt){
+
+  // One cone per actively-spraying Flamer, computed live from its
+  // own position/facing each frame rather than a traveling
+  // projectile entity — this is what makes "is this unit inside
+  // this cone right now" a cheap per-Flamer check instead of a
+  // pile of independent bullets to track.
+  const cones=units.filter(
+    f=>f.type==="flamer"&&
+       f.spraying&&
+       f.hp>0&&
+       !f.critical
+  );
+
+  function inCone(x,y,f){
+
+    const dx=x-f.x;
+    const dy=y-f.y;
+    const dist=Math.hypot(dx,dy);
+
+    if(dist>TYPES.flamer.range)
+      return false;
+
+    const angleTo=Math.atan2(dy,dx);
+
+    let diff=angleTo-f.facing;
+    diff=Math.atan2(Math.sin(diff),Math.cos(diff));
+
+    return Math.abs(diff)<=FLAME_CONE_HALF_ANGLE;
+  }
+
+  // --- Direct contact: damage + per-unit contact-time tracking ---
+  if(cones.length){
+
+    for(const v of units){
+
+      if(v.hp<=0&&!v.critical)
+        continue;
+
+      let hitCount=0;
+
+      for(const f of cones)
+        if(inCone(v.x,v.y,f))
+          hitCount++;
+
+      if(hitCount>0){
+
+        v.flameContactTime+=dt;
+        v.inFlameCone=true;
+
+        // A blanket class trait, not friendly-fire-specific —
+        // Flamers themselves take a flat resistant rate regardless
+        // of tree presence (their 7.5 doesn't get the tree bonus
+        // below). Everyone else takes the base rate, or the higher
+        // tree-bonus rate if standing in or near trees — the bonus
+        // replaces the base rather than stacking on top of it.
+        const perSecond=
+          v.type==="flamer"?
+          7.5:
+          treesNear(v.x,v.y,26)>0?
+          12:
+          10;
+
+        if(v.hp>0)
+          damageUnit(v,perSecond*hitCount*dt,null);
+
+      }else{
+
+        v.inFlameCone=false;
+
+        if(v.flameContactTime>0){
+          v.lastFlameContactDuration=v.flameContactTime;
+          v.recentFlameContactTimer=FLAME_RECENT_CONTACT_WINDOW;
+          v.flameContactTime=0;
+        }
+      }
+    }
+
+    // --- Trees: continuous-only contact, destroyed at 10s ---
+    for(let i=trees.length-1;i>=0;i--){
+
+      const tr=trees[i];
+      let hit=false;
+
+      for(const f of cones){
+
+        if(inCone(tr.x,tr.y,f)){
+          hit=true;
+          break;
+        }
+      }
+
+      if(hit){
+
+        tr.flameContactTime=(tr.flameContactTime||0)+dt;
+
+        if(tr.flameContactTime>=FLAME_TREE_BURN_TIME)
+          removeTree(tr);
+
+      }else{
+
+        tr.flameContactTime=0;
+      }
+    }
+
+  }else{
+
+    // No cones active anywhere this frame — still have to let
+    // anyone mid-exposure register that contact just ended
+    // (otherwise a unit whose Flamer died mid-spray would keep
+    // reading as "in contact" forever).
+    for(const v of units){
+
+      v.inFlameCone=false;
+
+      if(v.flameContactTime>0){
+        v.lastFlameContactDuration=v.flameContactTime;
+        v.recentFlameContactTimer=FLAME_RECENT_CONTACT_WINDOW;
+        v.flameContactTime=0;
+      }
+    }
+
+    for(const tr of trees)
+      tr.flameContactTime=0;
+  }
+
+  // --- Burning DoT — lethal, routes through damageUnit() like any
+  // other damage source (no bleed-style hard floor). ---
+  for(const u of units){
+
+    if(u.type==="flamer"||!u.burning)
+      continue;
+
+    if(u.hp<=0){
+      u.burning=false;
+      continue;
+    }
+
+    u.burnTickTimer-=dt;
+
+    if(u.burnTickTimer<=0){
+      u.burnTickTimer+=.5;
+      damageUnit(u,1,null);
+    }
+
+    if(u.hp<=0)
+      continue;
+
+    u.burnTimeLeft-=dt;
+
+    if(u.burnTimeLeft<=0)
+      u.burning=false;
+  }
+
+  // --- Inflicted Burning DoT — same deal, weaker rate. ---
+  for(const u of units){
+
+    if(u.type==="flamer"||!u.inflictedBurning)
+      continue;
+
+    if(u.hp<=0){
+      u.inflictedBurning=false;
+      continue;
+    }
+
+    u.inflictedBurnTickTimer-=dt;
+
+    if(u.inflictedBurnTickTimer<=0){
+      u.inflictedBurnTickTimer+=1;
+      damageUnit(u,1,null);
+    }
+
+    if(u.hp<=0)
+      continue;
+
+    u.inflictedBurnTimeLeft-=dt;
+
+    if(u.inflictedBurnTimeLeft<=0)
+      u.inflictedBurning=false;
+  }
+
+  // --- Contagion: a unit with (primary) Burning spreads Inflicted
+  // Burning to anyone it brushes past — team-agnostic, fire
+  // doesn't check IDs. Only Burning itself is contagious;
+  // Inflicted Burning doesn't chain further, or this could cascade
+  // indefinitely. ---
+  for(const u of units){
+
+    if(!u.burning||u.hp<=0)
+      continue;
+
+    for(const v of units){
+
+      if(
+        v===u||
+        v.hp<=0||
+        v.critical||
+        v.type==="flamer"||
+        v.burning||
+        v.inflictedBurning
+      )
+        continue;
+
+      if(Math.hypot(u.x-v.x,u.y-v.y)<FLAME_CONTACT_RANGE){
+        v.inflictedBurning=true;
+        v.inflictedBurnTimeLeft=5;
+        v.inflictedBurnTickTimer=1;
+      }
+    }
+  }
+
+  // --- Extinguish: a Flamer touching an ally carrying either
+  // status clears both and heals 5HP to each side. ---
+  for(const f of units){
+
+    if(f.type!=="flamer"||f.hp<=0||f.critical)
+      continue;
+
+    for(const v of units){
+
+      if(
+        v===f||
+        v.team!==f.team||
+        v.hp<=0||
+        v.critical||
+        (!v.burning&&!v.inflictedBurning)
+      )
+        continue;
+
+      if(Math.hypot(f.x-v.x,f.y-v.y)<FLAME_CONTACT_RANGE){
+
+        v.burning=false;
+        v.inflictedBurning=false;
+
+        v.hp=Math.min(v.maxhp,v.hp+5);
+        f.hp=Math.min(f.maxhp,f.hp+5);
+      }
     }
   }
 }
@@ -2601,10 +3152,19 @@ function updateUnitAI(u,dt){
   if(u.dragging)
     return;
 
-  // Piloting a kamikaze drone — see the engineer build logic and
+  // Piloting a drone — see the Drone Operator build logic and
   // updateDroneOperators(). Frozen in place, but still a fully
   // valid, targetable body standing on the field.
   if(u.frozenByDrone)
+    return;
+
+  // Inactive drone (Part 5 of the Drone Operator overhaul): its
+  // operator took damage mid-flight, so it's paused — no
+  // movement, no attacking — until the operator reaches Out of
+  // Danger and resumes control. Still fully present/destructible;
+  // updateDroneUnits() and updateKamikazeDrones() handle that side
+  // of it, this just stops it from acting on its own.
+  if(u.droneInactive)
     return;
 
   // Laser Sights punishes getting shot at with a brief stun.
@@ -2625,6 +3185,58 @@ function updateUnitAI(u,dt){
   // before the shot loses its edge.
   const engageRange=
     u.laserSights?t.range*1.35:t.range;
+
+  // Rifle Drone: a 12-round magazine and no reserve means
+  // isOutOfAmmo() reads true the instant it runs dry — at that
+  // point it stops acting like a rifleman entirely and switches
+  // to kamikaze behavior instead of the shared retreat/melee
+  // branching every other out-of-ammo unit gets. Same detonation
+  // profile as Kamikaze Drone's own on-target death (enemy-only).
+  if(u.type==="rifleDrone"&&isOutOfAmmo(u)){
+
+    let target=null;
+    let bd=Infinity;
+
+    for(const v of units){
+
+      if(
+        v.team===u.team||
+        v.hp<=0||
+        !INFANTRY_TYPES.includes(v.type)
+      )
+        continue;
+
+      const d=Math.hypot(v.x-u.x,v.y-u.y);
+
+      if(d<bd){
+        bd=d;
+        target=v;
+      }
+    }
+
+    if(target&&bd<38){
+
+      detonateDrone(u,false);
+
+      u.hp=0;
+      u.critical=false;
+
+      return;
+    }
+
+    if(target){
+      u.goal={x:target.x,y:target.y};
+    }else{
+
+      const enemyHQ=findBase(u.team===BLUE?RED:BLUE);
+
+      u.goal=enemyHQ?{x:enemyHQ.x,y:enemyHQ.y}:null;
+    }
+
+    u.order="kamikaze";
+
+    return;
+  }
 
   const threat=assessThreat(u,t.range*1.1);
   const outnumbered=threat>=3;
@@ -2766,6 +3378,23 @@ function updateUnitAI(u,dt){
       u.bleedTickTimer=.5;
     }
 
+    // Burning triggers the same way, from recent flame contact
+    // instead of a recent stab — duration is half however long
+    // that contact had lasted (see updateFlameEffects(), which
+    // snapshots lastFlameContactDuration the instant contact
+    // breaks). Flamers are fully immune, from any source.
+    if(
+      !wasRetreating&&
+      u.retreat&&
+      u.type!=="flamer"&&
+      u.recentFlameContactTimer>0&&
+      !u.burning
+    ){
+      u.burning=true;
+      u.burnTimeLeft=u.lastFlameContactDuration/2;
+      u.burnTickTimer=.5;
+    }
+
     if(dest&&isSafeSpot(u)){
 
       u.hp=Math.min(
@@ -2852,7 +3481,7 @@ function updateUnitAI(u,dt){
 
           wounded.hp=Math.min(
             wounded.maxhp,
-            wounded.hp+5
+            wounded.hp+5*(inTrench(wounded)?1.1:1)
           );
 
           // A medic's care stops the bleeding, same idea as
@@ -3020,6 +3649,58 @@ function updateUnitAI(u,dt){
         return;
       }
     }
+  }
+
+  // Flamer — this block only decides where to aim and whether to
+  // spray; fuel actually running dry is already fully handled by
+  // the shared out-of-ammo/melee branching above (isOutOfAmmo()
+  // and isMeleeEligible() both check fuel for this type), and the
+  // cone's actual damage/contact-time/status effects are resolved
+  // centrally every frame by updateFlameEffects(), not here — this
+  // is purely "should the nozzle be open right now, and which way
+  // is it pointed."
+  if(u.type==="flamer"){
+
+    const target=nearestEnemy(u,TYPES.flamer.range*1.2,false);
+
+    if(target){
+
+      u.target=target;
+
+      const d=Math.hypot(u.x-target.x,u.y-target.y);
+
+      if(d<=TYPES.flamer.range){
+
+        u.goal=null;
+        u.spraying=true;
+        u.order="spraying";
+
+      }else{
+
+        u.goal={x:target.x,y:target.y};
+        u.spraying=false;
+        u.order="advance";
+      }
+
+    }else{
+
+      u.target=null;
+      u.spraying=false;
+
+      // No target in range — fall through to the same role-based
+      // movement every other unit gets (rusher, for Flamer: push
+      // toward the enemy HQ) instead of just clearing state and
+      // sitting still. Without this, a Flamer with nobody nearby
+      // never advances at all.
+      const goal=chooseRoleGoal(u);
+
+      if(goal){
+        u.goal=goal;
+        u.order="advance";
+      }
+    }
+
+    return;
   }
 
   // Drone defense — a kamikaze drone closing in is a real,
@@ -3780,18 +4461,59 @@ function moveUnit(u,dt){
 
   const desiredAngle=Math.atan2(dy,dx);
 
-  // A follower matches its leader's speed instead of its own
-  // type's base speed for as long as it's following (see
-  // updateUnitAI's leader-follow block).
+  // Speed is resolved in three explicit tiers rather than one
+  // more inline ternary stacked on the last — this is the third
+  // time a new feature has needed to interact with movement speed
+  // (leader-follow override, melee boost, now the flame slow), so
+  // structuring it as three lists evaluated in order makes the
+  // next one a one-line addition instead of untangling this
+  // expression again.
+  //
+  // 1. Overrides — if any are active, the highest positive one
+  //    wins outright and everything else here is discarded.
+  const speedOverrides=[];
+
+  if(u.speedOverride!=null)
+    speedOverrides.push(u.speedOverride);
+
   const baseSpeed=
-    u.speedOverride!=null?
-    u.speedOverride:
+    speedOverrides.length?
+    Math.max(...speedOverrides):
     t.speed;
+
+  // 2. Positive multipliers — all active ones multiply together.
+  const speedBuffs=[];
+
+  if(nearOwnFlag(u))
+    speedBuffs.push(1.1);
+
+  if(u.order==="melee")
+    speedBuffs.push(1.5);
+
+  let buffMultiplier=1;
+
+  for(const b of speedBuffs)
+    buffMultiplier*=b;
+
+  // 3. Negative de-buffs — all active ones multiply together,
+  //    applied last, on top of tiers 1 and 2.
+  const speedDebuffs=[];
+
+  if(u.inFlameCone)
+    speedDebuffs.push(.85);
+
+  if(inTrench(u))
+    speedDebuffs.push(.9);
+
+  let debuffMultiplier=1;
+
+  for(const d of speedDebuffs)
+    debuffMultiplier*=d;
 
   const speed=
     baseSpeed*
-    (nearOwnFlag(u)?1.1:1)*
-    (u.order==="melee"?1.5:1);
+    buffMultiplier*
+    debuffMultiplier;
 
   const step=speed*dt;
 
@@ -3880,6 +4602,14 @@ function moveUnit(u,dt){
 
 function isOutOfAmmo(u){
 
+  // Flamer has no magazine/reserve at all — its one resource is
+  // fuel (see updateFlameEffects()/the fuel-drain block). Treating
+  // an empty tank as "out of ammo" here means it automatically
+  // gets the exact same retreat/melee branching every other
+  // out-of-ammo unit already does, for free.
+  if(u.type==="flamer")
+    return u.fuel<=0;
+
   // True only once BOTH the magazine and the reserve are empty —
   // a unit mid-reload still has ammo coming, so it isn't "out."
   return u.mag<=0&&u.reserve<=0;
@@ -3914,6 +4644,12 @@ function tryConsumeAmmo(u){
 function shoot(u,target,rateBonus=1){
 
   const t=TYPES[u.type];
+
+  // Weaponless units (Scout Drone) never fire at all — a single
+  // guard here is simpler and safer than hunting down every call
+  // site (combat, drone-defense) that might otherwise try to.
+  if(t.damage<=0)
+    return;
 
   if(u.cd>0)
     return;
@@ -3998,7 +4734,9 @@ function pickSpawnType(team){
     engineer:1,
     leader:1,
     comms:1,
-    supplier:1
+    supplier:1,
+    flamer:1,
+    droneOperator:1
   };
 
   // No working radio means no resupply calls, no drone requests,
@@ -4390,6 +5128,7 @@ function commanderAI(team,dt){
   // genuine chance to catch and shoot it down before it lands.
   if(
     !teams[team].pendingSupply&&
+    gameTime>=teams[team].chopperReadyTime&&
     teams[team].res<90&&
     hasComms(team)&&
     rand()<
@@ -4429,6 +5168,7 @@ function commanderAI(team,dt){
     });
 
     teams[team].pendingSupply=true;
+    teams[team].chopperReadyTime=gameTime+30;
 
     addChat(
       team,
@@ -4507,54 +5247,6 @@ function commanderAI(team,dt){
   );
 
   if(engineers.length){
-
-    // Drone operator: engineers build a cheap, expendable,
-    // unmanned drone instead of risking a trained soldier. It
-    // seeks out enemy infantry and self-destructs on contact —
-    // see updateKamikazeDrones(). Heavily gated on engineers
-    // being alive, since they're the ones building it.
-    if(
-      teams[team].res>=30&&
-      rand()<
-        (
-          teams[team].focus==="flank"||
-          teams[team].focus==="rush"?
-          .35:.22
-        )
-    ){
-
-      const e=engineers[
-        Math.floor(rand()*engineers.length)
-      ];
-
-      teams[team].res-=30;
-
-      // The engineer is piloting the drone remotely and freezes
-      // in place until it's destroyed (either by detonating or
-      // being shot down) — see updateDroneOperators(). They're
-      // still a normal, targetable body while frozen.
-      e.frozenByDrone=true;
-      e.droneThaw=0;
-      e.goal=null;
-      e.target=null;
-
-      kamikazeDrones.push({
-        id:nextId++,
-        team,
-        x:e.x,
-        y:e.y,
-        hp:14,
-        maxhp:14,
-        speed:82,
-        facing:e.facing,
-        operator:e
-      });
-
-      addChat(
-        team,
-        "Engineers deploying a drone operator."
-      );
-    }
 
     const objective=chooseObjective(team);
 
@@ -4639,6 +5331,92 @@ function commanderAI(team,dt){
         teams[team].res-=40;
 
         addChat(team,"Engineers laying a mine.");
+      }
+    }
+  }
+
+  // Drone Operator: builds and pilots any of three drone types
+  // instead of risking a trained soldier directly. The operator
+  // freezes in place (generalized frozenByDrone/droneThaw
+  // mechanic) until the drone is gone for good — doHasDrone()
+  // excludes an operator whose drone is merely Inactive (Part 5),
+  // since that's a paused state, not a terminal one, and a new
+  // drone can't be built until the old one is actually destroyed.
+  const drOps=units.filter(
+    u=>u.team===team&&
+       u.type==="droneOperator"&&
+       u.hp>0&&
+       !u.frozenByDrone&&
+       !doHasDrone(u)
+  );
+
+  if(
+    drOps.length&&
+    rand()<
+      (
+        teams[team].focus==="flank"||
+        teams[team].focus==="rush"?
+        .35:.22
+      )
+  ){
+
+    const roll=rand();
+
+    let droneType,cost;
+
+    if(roll<.5){
+      droneType="kamikaze";cost=20;
+    }else if(roll<.8){
+      droneType="scout";cost=20;
+    }else{
+      droneType="rifle";cost=25;
+    }
+
+    if(teams[team].res>=cost){
+
+      const op=drOps[
+        Math.floor(rand()*drOps.length)
+      ];
+
+      teams[team].res-=cost;
+
+      op.frozenByDrone=true;
+      op.droneThaw=0;
+      op.goal=null;
+      op.target=null;
+
+      if(droneType==="kamikaze"){
+
+        kamikazeDrones.push({
+          id:nextId++,
+          team,
+          x:op.x,
+          y:op.y,
+          hp:14,
+          maxhp:14,
+          speed:82,
+          facing:op.facing,
+          operator:op,
+          inactive:false
+        });
+
+        addChat(team,"Drone operator launching a kamikaze drone.");
+
+      }else if(droneType==="scout"){
+
+        makeUnit("scoutDrone",team,op.x,op.y);
+
+        units[units.length-1].operator=op;
+
+        addChat(team,"Drone operator launching a scout drone.");
+
+      }else{
+
+        makeUnit("rifleDrone",team,op.x,op.y);
+
+        units[units.length-1].operator=op;
+
+        addChat(team,"Drone operator launching a rifle drone.");
       }
     }
   }
@@ -4902,6 +5680,56 @@ function updateAirstrikePlanes(dt){
 // drone is destroyed, whether it detonated on contact or got shot
 // down. The engineer stays frozen a moment longer (see
 // updateDroneOperators()) before snapping back to normal.
+function findPilotedDrone(op){
+
+  // Reverse lookup: which drone (of any of the three types) this
+  // Drone Operator currently owns, active or Inactive. Used by
+  // doHasDrone() (can't build a new one until the old one is
+  // truly gone), the Inactive-state damage hook in damageUnit(),
+  // and the Out-of-Danger reactivation check below.
+  for(const d of kamikazeDrones)
+    if(d.operator===op)
+      return d;
+
+  for(const v of units)
+    if(
+      (v.type==="scoutDrone"||v.type==="rifleDrone")&&
+      v.operator===op&&
+      v.hp>0
+    )
+      return v;
+
+  return null;
+}
+
+
+function doHasDrone(op){
+
+  return !!findPilotedDrone(op);
+}
+
+
+function isOutOfDanger(u){
+
+  // "Out of Danger" for Part 5's reactivation check is explicitly
+  // a visibility check, not assessThreat()'s pure-distance one —
+  // an enemy within 160px but blocked by a wall doesn't count.
+  for(const v of units){
+
+    if(v.team===u.team||v.hp<=0)
+      continue;
+
+    if(Math.hypot(u.x-v.x,u.y-v.y)>160)
+      continue;
+
+    if(hasLineOfSight(u,v))
+      return false;
+  }
+
+  return true;
+}
+
+
 function releaseDroneOperator(d){
 
   if(
@@ -4914,19 +5742,18 @@ function releaseDroneOperator(d){
 }
 
 
-function detonateKamikazeDrone(d,indiscriminate=false){
+function detonateDrone(d,indiscriminate=false,blastR=60,dmg=55){
 
   // Splash damage, mortar/mine-style — full damage right at the
   // point of impact, tapering off toward the edge of the blast.
   // Normally only the enemy team is caught in it (that's the
-  // drone's whole purpose), but a drone shot down out of the sky
+  // drone's whole purpose), but a drone shot down out of the sky,
+  // one that strayed past its leash, or one whose operator died
   // detonates prematurely and doesn't discriminate — it can catch
   // its own team in the blast too. NOTE: blast damage is still
   // pure radial falloff and doesn't know building walls exist —
   // dampening/blocking a blast by walls is deferred, see the
   // Single-Room Buildings writeup.
-  const blastR=60;
-
   for(const v of units){
 
     if(
@@ -4939,7 +5766,7 @@ function detonateKamikazeDrone(d,indiscriminate=false){
       if(bd<blastR){
 
         const falloff=Math.max(0,1-bd/blastR);
-        damageUnit(v,55*falloff,null);
+        damageUnit(v,dmg*falloff,null);
       }
     }
   }
@@ -4952,15 +5779,63 @@ function detonateKamikazeDrone(d,indiscriminate=false){
 }
 
 
+// How far a drone can stray from its Drone Operator before the
+// leash rule kicks in — same distance regardless of drone type or
+// active/Inactive state, only the consequence differs (see
+// updateKamikazeDrones()/the Scout+Rifle Drone AI blocks).
+const DRONE_LEASH_RANGE=500;
+const DRONE_LEASH_BLAST_RADIUS=20;
+const DRONE_LEASH_BLAST_DAMAGE=20;
+
+
 function updateKamikazeDrones(dt){
 
-  // Engineer-built, expendable, unmanned — flies toward the
-  // nearest living enemy infantry unit and self-destructs once
-  // it's close, dealing splash damage. The enemy can shoot it
-  // down first (see updateBullets), so it isn't a free kill.
+  // Drone-Operator-piloted, expendable, unmanned — flies toward
+  // the nearest living enemy infantry unit and self-destructs
+  // once it's close, dealing splash damage. The enemy can shoot
+  // it down first (see updateBullets), so it isn't a free kill.
   for(let i=kamikazeDrones.length-1;i>=0;i--){
 
     const d=kamikazeDrones[i];
+
+    // Case 4: the DO piloting this drone has died outright —
+    // friendly-fire explosion, same profile as a shoot-down.
+    if(!d.operator||d.operator.hp<=0){
+
+      detonateDrone(d,true);
+      kamikazeDrones.splice(i,1);
+      continue;
+    }
+
+    // Case 3: the 500px leash always applies, active or Inactive,
+    // but the consequence differs — an active drone that strays
+    // too far blows up on its own team with a small fixed blast;
+    // an Inactive one just quietly ceases to exist, no explosion
+    // at all. A DO fleeing far enough to reach safety can lose an
+    // Inactive drone entirely as the price of surviving.
+    const leashDist=Math.hypot(d.x-d.operator.x,d.y-d.operator.y);
+
+    if(leashDist>DRONE_LEASH_RANGE){
+
+      if(d.inactive){
+        releaseDroneOperator(d);
+      }else{
+        detonateDrone(
+          d,true,
+          DRONE_LEASH_BLAST_RADIUS,
+          DRONE_LEASH_BLAST_DAMAGE
+        );
+      }
+
+      kamikazeDrones.splice(i,1);
+      continue;
+    }
+
+    // Part 5: Inactive — stopped moving/attacking, but still
+    // present and destructible by enemy fire (handled generically
+    // in updateBullets, unaffected by this flag).
+    if(d.inactive)
+      continue;
 
     let target=null;
     let bd=Infinity;
@@ -4984,7 +5859,8 @@ function updateKamikazeDrones(dt){
 
     if(target&&bd<38){
 
-      detonateKamikazeDrone(d);
+      // Case 2: reached its own objective — enemy-only explosion.
+      detonateDrone(d);
       kamikazeDrones.splice(i,1);
       continue;
     }
@@ -5012,6 +5888,57 @@ function updateKamikazeDrones(dt){
 
     d.x+=(dx/dist)*d.speed*dt;
     d.y+=(dy/dist)*d.speed*dt;
+  }
+}
+
+
+function updateDroneUnits(){
+
+  // Scout Drone and Rifle Drone live as real units (for
+  // chooseRoleGoal()/nearestEnemy()/moveUnit()), so they need
+  // their own equivalent of the leash/DO-death rules
+  // updateKamikazeDrones() already runs for the lightweight
+  // Kamikaze Drone — cases 3 and 4 of the death rules, checked
+  // every frame rather than left to the throttled AI think-cycle.
+  for(const v of units){
+
+    if(
+      (v.type!=="scoutDrone"&&v.type!=="rifleDrone")||
+      v.hp<=0
+    )
+      continue;
+
+    // Case 4: the DO piloting this drone has died outright.
+    if(!v.operator||v.operator.hp<=0){
+
+      detonateDrone(v,true);
+
+      v.hp=0;
+      v.critical=false;
+
+      continue;
+    }
+
+    // Case 3: the 500px leash — active drones blow up on their
+    // own team with a small fixed blast; an Inactive one just
+    // ceases to exist, no explosion at all.
+    const leashDist=Math.hypot(v.x-v.operator.x,v.y-v.operator.y);
+
+    if(leashDist>DRONE_LEASH_RANGE){
+
+      if(v.droneInactive){
+        releaseDroneOperator(v);
+      }else{
+        detonateDrone(
+          v,true,
+          DRONE_LEASH_BLAST_RADIUS,
+          DRONE_LEASH_BLAST_DAMAGE
+        );
+      }
+
+      v.hp=0;
+      v.critical=false;
+    }
   }
 }
 
@@ -5057,6 +5984,36 @@ function updateDroneOperators(dt){
       if(u.droneThaw<=0){
         u.droneThaw=0;
         u.frozenByDrone=false;
+      }
+    }
+
+    // Part 5: a DO whose drone went Inactive (it got hit while
+    // piloting — see the instant-thaw hook in damageUnit())
+    // regains control the moment it reaches Out of Danger: no
+    // visible enemy within 160px.
+    if(
+      u.type==="droneOperator"&&
+      !u.frozenByDrone&&
+      u.hp>0
+    ){
+
+      const drone=findPilotedDrone(u);
+
+      if(
+        drone&&
+        (drone.inactive||drone.droneInactive)&&
+        isOutOfDanger(u)
+      ){
+
+        u.frozenByDrone=true;
+        u.droneThaw=0;
+        u.goal=null;
+        u.target=null;
+
+        if(drone.inactive!==undefined)
+          drone.inactive=false;
+        else
+          drone.droneInactive=false;
       }
     }
   }
@@ -5191,9 +6148,14 @@ function updateRescues(dt){
       continue;
     }
 
-    const medic=nearbyReviveMedic(v);
+    // beingHealed starts false and only flips true below, as a
+    // direct consequence of revive progress actually advancing
+    // this tick — not as an independent "a medic happens to be
+    // nearby" precondition. That way the two facts can't silently
+    // drift apart after some future edit to this block.
+    v.beingHealed=false;
 
-    v.beingHealed=!!medic;
+    const medic=nearbyReviveMedic(v);
 
     if(!medic)
       continue;
@@ -5202,9 +6164,16 @@ function updateRescues(dt){
 
       const elapsed=22-v.criticalTimer;
       v.reviveRequired=clamp(3+(elapsed/22)*4,3,7);
+
+      if(inTrench(v))
+        v.reviveRequired*=.9;
     }
 
+    const progressBefore=v.reviveProgress;
+
     v.reviveProgress+=dt;
+
+    v.beingHealed=v.reviveProgress>progressBefore;
 
     if(v.reviveProgress>=v.reviveRequired){
 
@@ -5313,6 +6282,9 @@ function updateSupplyDeliveries(dt){
       const fraction=deficit/TYPES[v.type].reserveSize;
 
       v.resupplyRequired=3+fraction*4;
+
+      if(inTrench(v))
+        v.resupplyRequired*=.9;
     }
 
     v.resupplyProgress+=dt;
@@ -5426,7 +6398,15 @@ function updateFlags(dt){
         )<95
       ){
 
-        counts[u.team]++;
+        // Scout Drone contributes half a "unit" toward its team's
+        // pressure on a flag; Rifle Drone doesn't factor in at
+        // all, same as Kamikaze already didn't (it lives in a
+        // separate array, never reaches this loop in the first
+        // place). Everyone else counts as a full unit, as before.
+        counts[u.team]+=
+          u.type==="scoutDrone"?.5:
+          u.type==="rifleDrone"?0:
+          1;
       }
     }
 
@@ -5555,7 +6535,13 @@ function updateBullets(dt){
 
         }else{
 
-          damageUnit(u,b.damage,b.source);
+          // A dug-in defender ducks clear of most direct fire —
+          // explosions and flame contact don't roll against this
+          // at all, they resolve through entirely separate code
+          // paths (the blast-splash loop above, and
+          // updateFlameEffects()).
+          if(!(inTrench(u)&&rand()<.75))
+            damageUnit(u,b.damage,b.source);
         }
 
         spawnParticles(
@@ -5749,6 +6735,14 @@ function updateBullets(dt){
 
           teams[c.team].pendingSupply=null;
 
+          // Losing a resupply chopper is a real setback, not just
+          // a wasted trip — the cargo (and then some) effectively
+          // ends up funding whoever shot it down.
+          const enemyTeam=c.team===BLUE?RED:BLUE;
+
+          teams[c.team].res=Math.max(0,teams[c.team].res-50);
+          teams[enemyTeam].res+=50;
+
           const idx=choppers.indexOf(c);
 
           if(idx>=0)
@@ -5793,7 +6787,7 @@ function updateBullets(dt){
           // Shot down mid-flight — it goes off right where it
           // was hit, and unlike a clean contact-detonation it
           // doesn't discriminate by team.
-          detonateKamikazeDrone(kd,true);
+          detonateDrone(kd,true);
 
           const idx=kamikazeDrones.indexOf(kd);
 
@@ -5955,7 +6949,7 @@ function cleanup(){
   });
 
   structures=structures.filter(
-    s=>s.hp>0
+    s=>s.kind==="trench"||s.hp>0
   );
 }
 
@@ -6022,6 +7016,52 @@ function simulationStep(){
     if(u.recentlyStabbedTimer>0)
       u.recentlyStabbedTimer=Math.max(0,u.recentlyStabbedTimer-SIM_STEP);
 
+    if(u.recentFlameContactTimer>0)
+      u.recentFlameContactTimer=Math.max(0,u.recentFlameContactTimer-SIM_STEP);
+
+    if(u.type==="flamer"){
+
+      if(u.fuel<=0){
+
+        // The shared out-of-ammo retreat/melee branching in
+        // updateUnitAI() returns early for a dry Flamer before
+        // ever reaching the Flamer-specific block that normally
+        // clears this flag — force it off here instead, so an
+        // empty tank can never keep reading as an active cone.
+        u.spraying=false;
+
+        // Flat 1s tank swap once close enough to a Supplier —
+        // deliberately not the proportional 3-7s scaling ammo
+        // reserves use elsewhere; this is a full swap, not a
+        // gradual transfer, so the duration doesn't depend on how
+        // empty the tank was.
+        const supplier=nearestSupplier(u.team,u.x,u.y);
+
+        if(supplier&&Math.hypot(u.x-supplier.x,u.y-supplier.y)<40){
+
+          const swapTime=inTrench(u)?.9:1;
+
+          u.fuelRefillTimer=
+            u.fuelRefillTimer>0?
+            u.fuelRefillTimer-SIM_STEP:
+            swapTime;
+
+          if(u.fuelRefillTimer<=0){
+            u.fuel=30;
+            u.fuelRefillTimer=0;
+          }
+
+        }else{
+
+          u.fuelRefillTimer=inTrench(u)?.9:1;
+        }
+
+      }else if(u.spraying){
+
+        u.fuel=Math.max(0,u.fuel-SIM_STEP);
+      }
+    }
+
     if(u.reloading){
 
       u.reloadTimer-=SIM_STEP;
@@ -6058,11 +7098,14 @@ function simulationStep(){
   updateChoppers(SIM_STEP);
   updateAirstrikePlanes(SIM_STEP);
   updateKamikazeDrones(SIM_STEP);
+  updateDroneUnits();
+  updateScoutDroneReveals();
   updateDroneOperators(SIM_STEP);
   updateLeaderFollowDwell(SIM_STEP);
   updateRescues(SIM_STEP);
   updateSupplyDeliveries(SIM_STEP);
   updateBleeding(SIM_STEP);
+  updateFlameEffects(SIM_STEP);
   updateMines(SIM_STEP);
 
   cleanup();
@@ -7064,6 +8107,121 @@ function drawUnitIcon(c,type,team,ghillie,laser,melee){
     c.strokeStyle="#111";
     c.lineWidth=2;
     c.fillRect(6,-2,12,4);
+
+  }else if(type==="flamer"){
+
+    c.fillRect(-8,-9,16,18);
+
+    // fuel tank slung on the back
+    c.fillStyle="#5c3d1f";
+
+    c.beginPath();
+    c.arc(-13,0,7,0,Math.PI*2);
+    c.fill();
+    c.stroke();
+
+    // nozzle/hose forward
+    c.strokeStyle="#3d2c17";
+    c.lineWidth=3;
+    c.beginPath();
+    c.moveTo(6,0);
+    c.lineTo(18,0);
+    c.stroke();
+
+    if(melee){
+
+      c.fillStyle="#d8d8d8";
+      c.strokeStyle="#111";
+      c.lineWidth=1.5;
+
+      c.beginPath();
+      c.moveTo(6,-2);
+      c.lineTo(20,0);
+      c.lineTo(6,2);
+      c.closePath();
+      c.fill();
+      c.stroke();
+    }
+
+  }else if(type==="droneOperator"){
+
+    c.fillRect(-8,-9,16,18);
+
+    // handheld controller
+    c.fillStyle="#2a2a26";
+    c.fillRect(4,-6,10,10);
+
+    c.strokeStyle="#ffb347";
+    c.lineWidth=1.5;
+    c.beginPath();
+    c.moveTo(6,-4);
+    c.lineTo(6,4);
+    c.moveTo(11,-4);
+    c.lineTo(11,4);
+    c.stroke();
+
+    // antenna
+    c.strokeStyle="#111";
+    c.lineWidth=1.5;
+    c.beginPath();
+    c.moveTo(-6,-9);
+    c.lineTo(-9,-16);
+    c.stroke();
+
+  }else if(type==="scoutDrone"){
+
+    // small, light quadcopter body — no weapon
+    c.fillStyle="#c7cdbe";
+    c.beginPath();
+    c.arc(0,0,8,0,Math.PI*2);
+    c.fill();
+    c.stroke();
+
+    c.strokeStyle="#111";
+    c.lineWidth=1.5;
+    c.beginPath();
+    c.moveTo(-9,-9);c.lineTo(9,9);
+    c.moveTo(9,-9);c.lineTo(-9,9);
+    c.stroke();
+
+    c.fillStyle="#63a7ff";
+    for(const[ox,oy] of [[-9,-9],[9,-9],[-9,9],[9,9]]){
+      c.beginPath();
+      c.arc(ox,oy,2.5,0,Math.PI*2);
+      c.fill();
+    }
+
+    // camera lens, forward-facing
+    c.fillStyle="#111";
+    c.beginPath();
+    c.arc(6,0,2.5,0,Math.PI*2);
+    c.fill();
+
+  }else if(type==="rifleDrone"){
+
+    // compact quadcopter body with a small rifle slung forward
+    c.fillStyle="#8a8a82";
+    c.beginPath();
+    c.arc(0,0,9,0,Math.PI*2);
+    c.fill();
+    c.stroke();
+
+    c.strokeStyle="#111";
+    c.lineWidth=1.5;
+    c.beginPath();
+    c.moveTo(-10,-10);c.lineTo(10,10);
+    c.moveTo(10,-10);c.lineTo(-10,10);
+    c.stroke();
+
+    c.fillStyle="#ff5a3d";
+    for(const[ox,oy] of [[-10,-10],[10,-10],[-10,10],[10,10]]){
+      c.beginPath();
+      c.arc(ox,oy,2.5,0,Math.PI*2);
+      c.fill();
+    }
+
+    c.fillStyle="#f0f0df";
+    c.fillRect(5,-2,16,4);
   }
 }
 
@@ -7074,37 +8232,49 @@ function drawUnit(u){
 
   ctx.save();
 
+  // Concealed units render at reduced opacity — but only if
+  // they're actually hidden right now, not just standing near
+  // trees. A Scout Drone reveal (isRevealed()) overrides this
+  // back to full opacity even though isConcealed() alone would
+  // still say yes. 45% transparent = 55% opacity.
+  ctx.globalAlpha=
+    isConcealed(u)&&!isRevealed(u)?
+    .55:
+    1;
+
   ctx.translate(u.x,u.y);
 
   if(u.critical){
 
-    // Down and out — a dim, flattened silhouette lying where they
-    // fell, with a pulsing distress marker instead of a weapon,
-    // and a countdown bar (bleed-out timer) instead of a health bar.
+    // Down and out — the unit's own type icon, darkened with an
+    // actual color tint (a semi-transparent black overlay), not
+    // the alpha-reduction technique concealment uses elsewhere —
+    // that visual language already means "translucent," this
+    // needs to read as "dimmed" instead. A pulsing "!" stands in
+    // for the weapon as a distress marker, and the bleed-out
+    // countdown bar underneath is unchanged.
     ctx.save();
     ctx.rotate(u.facing);
 
-    ctx.fillStyle=
-      u.team===BLUE?
-      "#2c4657":
-      "#4a2f31";
+    drawUnitIcon(ctx,u.type,u.team,u.ghillie,u.laserSights,false);
 
+    ctx.fillStyle="rgba(0,0,0,.55)";
     ctx.beginPath();
-    ctx.ellipse(0,0,t.radius+3,t.radius*.55,0,0,Math.PI*2);
-    ctx.fill();
-
-    ctx.strokeStyle="#00000080";
-    ctx.lineWidth=1.5;
-    ctx.stroke();
-
-    const pulse=.5+.5*Math.sin(gameTime*6);
-
-    ctx.fillStyle=`rgba(255,80,60,${pulse})`;
-    ctx.beginPath();
-    ctx.arc(0,0,3.5,0,Math.PI*2);
+    ctx.arc(0,0,t.radius+16,0,Math.PI*2);
     ctx.fill();
 
     ctx.restore();
+
+    // Drawn unrotated (like the bar below), so the marker always
+    // reads as hovering above the unit rather than spinning with
+    // whichever way they happened to be facing when they went down.
+    const pulse=.5+.5*Math.sin(gameTime*6);
+
+    ctx.fillStyle=`rgba(255,80,60,${pulse})`;
+    ctx.font="bold 14px sans-serif";
+    ctx.textAlign="center";
+    ctx.textBaseline="middle";
+    ctx.fillText("!",0,-t.radius-18);
 
     const frac=clamp(u.criticalTimer/22,0,1);
 
@@ -7619,6 +8789,35 @@ function draw(){
     }
   }
 
+  // flame cones — drawn before units so anyone standing inside
+  // reads as "in the fire" rather than the flame drawing over them
+  for(const f of units){
+
+    if(f.type!=="flamer"||!f.spraying||f.hp<=0||f.critical)
+      continue;
+
+    const range=TYPES.flamer.range;
+
+    ctx.save();
+    ctx.translate(f.x,f.y);
+    ctx.rotate(f.facing);
+
+    const grad=ctx.createRadialGradient(0,0,0,0,0,range);
+    grad.addColorStop(0,"rgba(255,200,80,.55)");
+    grad.addColorStop(.6,"rgba(255,120,40,.35)");
+    grad.addColorStop(1,"rgba(255,60,20,0)");
+
+    ctx.fillStyle=grad;
+
+    ctx.beginPath();
+    ctx.moveTo(0,0);
+    ctx.arc(0,0,range,-FLAME_CONE_HALF_ANGLE,FLAME_CONE_HALF_ANGLE);
+    ctx.closePath();
+    ctx.fill();
+
+    ctx.restore();
+  }
+
   // units
   for(const u of units)
     drawUnit(u);
@@ -8114,7 +9313,8 @@ function reset(){
     airstrikeReadyTime:gameTime+60,
     pendingAirstrike:null,
     pendingUpgrades:[],
-    spawnRecency:{}
+    spawnRecency:{},
+    chopperReadyTime:0
   };
 
   teams[RED]={
@@ -8133,7 +9333,8 @@ function reset(){
     airstrikeReadyTime:gameTime+60,
     pendingAirstrike:null,
     pendingUpgrades:[],
-    spawnRecency:{}
+    spawnRecency:{},
+    chopperReadyTime:0
   };
 
   teamChat=[[],[]];
@@ -8381,15 +9582,46 @@ const UNIT_INFO={
 
   engineer:"Doesn't fight much, but builds barriers (clearing any "+
     "trees in the way first), seals four+ clustered walls into a "+
-    "bunker, and is the only unit that can build a kamikaze drone "+
-    "or requisition supplies alongside comms.",
+    "bunker, and can requisition supplies alongside comms.",
 
   vehicle:"An armored car built by engineers over 2 in-game days. "+
     "Tanky and hard-hitting. Plays a rusher, same as riflemen.",
 
   mortar:"A two-man indirect-fire team built by engineers over 1 "+
     "in-game day. Very long range. Plays a sniper: hangs back near "+
-    "cover rather than advancing into the open."
+    "cover rather than advancing into the open.",
+
+  supplier:"A lightly-armed logistics unit carrying a 1000-round "+
+    "field pack — tops up any ally's ammo reserve on contact, and "+
+    "delivers finished upgrade kits (see Ghillie Suit / Laser "+
+    "Sights) straight to whoever they fit. Plays a support role: "+
+    "seeks out whoever needs it most rather than holding ground, "+
+    "and heads for the nearest depot the instant its own pack "+
+    "runs dry.",
+
+  flamer:"Sprays a short, forward cone of sustained fire instead "+
+    "of firing discrete shots — anyone standing in it burns for as "+
+    "long as they stay, Flamer included (at a reduced rate, even "+
+    "from an ally's cone). Runs on a 30-point fuel tank rather "+
+    "than a magazine, refilled at a Supplier once empty. Plays a "+
+    "rusher, same as riflemen, pushing hard toward the enemy HQ.",
+
+  droneOperator:"Pistol-armed support that builds and remotely "+
+    "pilots one of three drones (Kamikaze, Scout, or Rifle) — see "+
+    "Battlefield Assets for how each behaves. Freezes in place "+
+    "while actively piloting, and can't queue a second drone until "+
+    "the first is actually destroyed, not just paused.",
+
+  scoutDrone:"Unarmed — deals no damage and never fires. Patrols "+
+    "toward flags (counting as half a unit toward capturing one) "+
+    "and strips concealment from any enemy in its line of sight. "+
+    "Piloted by a Drone Operator; see Battlefield Assets.",
+
+  rifleDrone:"Fights like a lighter, slower-firing rifleman with a "+
+    "12-round magazine and no reserve or reload — once it runs "+
+    "dry it goes kamikaze instead of retreating, seeking out an "+
+    "enemy to detonate against. Doesn't factor into flag capture "+
+    "at all. Piloted by a Drone Operator; see Battlefield Assets."
 
 };
 
@@ -8404,19 +9636,37 @@ const ROLE_LABELS={
 const ASSET_INFO=[
   {
     name:"Resupply Chopper",
-    blurb:"Any infantry with a working radio can call one in. It "+
-      "spawns at a random point on the battlefield — not safely "+
-      "off-map — and physically flies to base over roughly 2 "+
-      "in-game days. The enemy can shoot it down before it arrives; "+
-      "if it makes it, it drops 50 material."
+    blurb:"Any infantry with a working radio can call one in, once "+
+      "every 30s per team. It spawns at a random point on the "+
+      "battlefield — not safely off-map — and physically flies to "+
+      "base over roughly 2 in-game days. The enemy can shoot it "+
+      "down before it arrives; if it makes it, it drops 50 "+
+      "material. If it's shot down instead, the loss stings twice "+
+      "over — the owning team loses 50 material and whoever shot "+
+      "it down gains 50."
   },
   {
-    name:"Drone Operator (Kamikaze Drone)",
-    blurb:"Engineers can build a cheap, unmanned drone for 30 "+
-      "material instead of risking a trained soldier. It seeks out "+
-      "the nearest living enemy infantry unit and self-destructs on "+
-      "contact for a solid splash of damage. It's fragile (25 HP) "+
-      "and the enemy can shoot it down before it reaches anyone."
+    name:"Drone Operator & Drones",
+    blurb:"A Drone Operator builds and remotely pilots one of three "+
+      "expendable drones instead of risking a trained soldier "+
+      "directly, freezing in place while it does. Kamikaze Drone "+
+      "(20 material, 14 HP) seeks the nearest enemy infantry and "+
+      "self-destructs on contact. Scout Drone (20 material, "+
+      "unarmed) patrols toward flags, counts as half a unit toward "+
+      "capturing one, and strips concealment from any enemy in its "+
+      "sight. Rifle Drone (25 material) fights like a lighter "+
+      "rifleman with a 12-round magazine and no reload — once it "+
+      "runs dry it goes kamikaze instead of retreating. A drone "+
+      "shot down, or one that strays more than 500px from its "+
+      "operator while still active, explodes and catches its own "+
+      "side in the blast too; reaching its own target explodes "+
+      "enemy-only. If the operator takes a hit while piloting, it "+
+      "instantly regains control and the drone goes Inactive — "+
+      "paused but still destructible — until the operator loses "+
+      "sight of every nearby enemy, at which point it resumes "+
+      "control. An Inactive drone that drifts past the 500px leash "+
+      "just vanishes with no explosion at all, and a new drone "+
+      "can't be queued until the current one is actually destroyed."
   },
   {
     name:"Ghillie Suit (Marksman upgrade)",
@@ -8494,20 +9744,6 @@ const ASSET_INFO=[
       "instead — vehicles always fall back, having no infantry "+
       "melee option. Watch a unit's ammo count above its health "+
       "bar while it's reloading to see this in action."
-  },
-  {
-    name:"Supplier",
-    blurb:"A lightly-armed logistics unit carrying a 1000-round "+
-      "field pack. Any ally that reaches one gets its reserve "+
-      "topped up over 3-7s, depending on how much is actually "+
-      "missing. Once its own pack runs dry, it immediately breaks "+
-      "off and heads for the nearest HQ, barracks, or bunker, "+
-      "refilling instantly there — a depot has effectively "+
-      "unlimited logistics, a field handoff between two soldiers "+
-      "doesn't. A Supplier hauling a finished upgrade kit (see "+
-      "Ghillie Suit / Laser Sights) shows a small gold marker and "+
-      "prioritizes delivering it over routine ammo runs — but if "+
-      "it dies first, the upgrade is lost for good."
   },
   {
     name:"Critical Failure & Rescue",
